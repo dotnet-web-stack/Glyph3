@@ -159,3 +159,47 @@ public class QpackEncoderStreamTests
 
     private static string Text(ReadOnlySpan<byte> value) => Encoding.ASCII.GetString(value);
 }
+
+/// <summary>
+/// Our decoder stream. Without Insert Count Increment a peer that respects 0 blocked streams never
+/// learns it may reference anything, so the table compresses nothing while looking correct.
+/// </summary>
+public class QpackDecoderStreamTests
+{
+    [Theory]
+    [InlineData(1, new byte[] { 0x01 })]
+    [InlineData(10, new byte[] { 0x0a })]
+    [InlineData(62, new byte[] { 0x3e })]
+    [InlineData(63, new byte[] { 0x3f, 0x00 })]     // 6-bit prefix saturates
+    [InlineData(200, new byte[] { 0x3f, 0x89, 0x01 })]
+    public void InsertCountIncrementUsesASixBitPrefix(long increment, byte[] expected)
+    {
+        Span<byte> buffer = stackalloc byte[8];
+
+        int written = QpackDecoderStream.WriteInsertCountIncrement(buffer, increment);
+
+        Assert.Equal(expected, buffer[..written].ToArray());
+    }
+
+    [Fact]
+    public void SectionAcknowledgmentSetsItsPatternBit()
+    {
+        Span<byte> buffer = stackalloc byte[8];
+
+        int written = QpackDecoderStream.WriteSectionAcknowledgment(buffer, 4);
+
+        Assert.Equal(1, written);
+        Assert.Equal(0x84, buffer[0]);   // 1 then stream id 4
+    }
+
+    [Fact]
+    public void StreamCancellationSetsItsPatternBits()
+    {
+        Span<byte> buffer = stackalloc byte[8];
+
+        int written = QpackDecoderStream.WriteStreamCancellation(buffer, 8);
+
+        Assert.Equal(1, written);
+        Assert.Equal(0x48, buffer[0]);   // 01 then stream id 8
+    }
+}

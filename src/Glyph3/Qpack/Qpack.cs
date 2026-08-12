@@ -83,20 +83,55 @@ internal static class Qpack
     /// dynamic-table reference (illegal against our capacity-0 advertisement).
     /// </summary>
     public static bool TryDecodeFieldSection(ReadOnlySpan<byte> input, Http3Request request)
+        => TryDecodeFieldSection(input, request, null, 0);
+
+    /// <summary>
+    /// Decode a field section, resolving dynamic references against <paramref name="table"/>.
+    /// </summary>
+    /// <remarks>
+    /// A null table is the capacity-0 contract: any dynamic reference is refused, because we told
+    /// the peer we keep no table.
+    ///
+    /// <para>With a table, a Required Insert Count above what we have received is refused too. We
+    /// advertise 0 blocked streams, so a conforming peer only references what it knows we hold; a
+    /// peer that does otherwise is in error rather than merely early, and that is what keeps this a
+    /// pure function instead of a suspended request.</para>
+    /// </remarks>
+    internal static bool TryDecodeFieldSection(ReadOnlySpan<byte> input, Http3Request request,
+        QpackDynamicTable? table, int advertisedCapacity)
     {
-        // Prefix: Required Insert Count (8-bit prefix) + sign/Delta Base (7-bit prefix). With no
-        // dynamic table a conforming encoder sends RIC = 0; anything else references state we
-        // don't have.
-        if (!TryReadInt(input, 8, out long ric, out int c1) || ric != 0)
+        // Prefix: encoded Required Insert Count (8-bit prefix), then sign + Delta Base (7-bit).
+        if (!TryReadInt(input, 8, out long encodedInsertCount, out int c1))
         {
             return false;
         }
         input = input[c1..];
-        if (!TryReadInt(input, 7, out _, out int c2))
+
+        if (input.IsEmpty)
+        {
+            return false;
+        }
+
+        bool negative = (input[0] & 0x80) != 0;
+
+        if (!TryReadInt(input, 7, out long deltaBase, out int c2))
         {
             return false;
         }
         input = input[c2..];
+
+        if (!TryDecodeInsertCount(encodedInsertCount, table, advertisedCapacity, out long requiredInsertCount))
+        {
+            return false;
+        }
+
+        // Everything the section references is addressed relative to Base (RFC 9204 4.5.1.2).
+        long baseIndex = negative ? requiredInsertCount - deltaBase - 1 : requiredInsertCount + deltaBase;
+
+        if (baseIndex < 0)
+        {
+            return false;
+        }
 
         while (!input.IsEmpty)
         {
@@ -104,38 +139,68 @@ internal static class Qpack
 
             if ((first & 0x80) != 0)
             {
-                // Indexed Field Line: 1 T index(6+). T=1 static.
-                if ((first & 0x40) == 0)
+                // Indexed Field Line: 1 T index(6+). T=1 static, T=0 dynamic.
+                if (!TryReadInt(input, 6, out long idx, out int consumed))
                 {
-                    return false;   // dynamic reference
+                    return false;
                 }
-                if (!TryReadInt(input, 6, out long idx, out int consumed) || idx >= QpackStatic.Table.Length)
+
+                if ((first & 0x40) != 0)
+                {
+                    if (idx >= QpackStatic.Table.Length)
+                    {
+                        return false;
+                    }
+                    input = input[consumed..];
+                    (byte[] name, byte[] value) = QpackStatic.Table[idx];
+                    request.AddField(name, value);
+                    continue;
+                }
+
+                // Relative to Base, counting backwards (RFC 9204 4.5.2).
+                if (!TryResolve(table, baseIndex - idx - 1, out ReadOnlySpan<byte> dynName, out ReadOnlySpan<byte> dynValue))
                 {
                     return false;
                 }
                 input = input[consumed..];
-                (byte[] name, byte[] value) = QpackStatic.Table[idx];
-                request.AddField(name, value);
+                request.AddField(dynName, dynValue);
                 continue;
             }
 
             if ((first & 0x40) != 0)
             {
                 // Literal With Name Reference: 01 N T index(4+), then value string.
-                if ((first & 0x10) == 0)
-                {
-                    return false;   // dynamic name reference
-                }
-                if (!TryReadInt(input, 4, out long idx, out int consumed) || idx >= QpackStatic.Table.Length)
+                bool staticName = (first & 0x10) != 0;
+
+                if (!TryReadInt(input, 4, out long idx, out int consumed))
                 {
                     return false;
                 }
+
+                ReadOnlySpan<byte> nameRef;
+
+                if (staticName)
+                {
+                    if (idx >= QpackStatic.Table.Length)
+                    {
+                        return false;
+                    }
+                    nameRef = QpackStatic.Table[idx].Name;
+                }
+                else if (!TryResolve(table, baseIndex - idx - 1, out nameRef, out _))
+                {
+                    return false;
+                }
+
+                // Copied: resolving borrows from the table, and AddField may outlive that.
+                byte[] heldName = nameRef.ToArray();
+
                 input = input[consumed..];
                 if (!TryDecodeString(ref input, 7, out byte[] value, out int valueLen))
                 {
                     return false;
                 }
-                request.AddField(QpackStatic.Table[idx].Name, value.AsSpan(0, valueLen));
+                request.AddField(heldName, value.AsSpan(0, valueLen));
                 ArrayPool<byte>.Shared.Return(value);
                 continue;
             }
@@ -158,10 +223,110 @@ internal static class Qpack
                 continue;
             }
 
-            return false;   // post-base forms (0001/0000) - dynamic table only
+            if ((first & 0x10) != 0)
+            {
+                // Post-Base Indexed Field Line: 0001 index(4+), counting forward from Base.
+                if (!TryReadInt(input, 4, out long postIdx, out int postConsumed) ||
+                    !TryResolve(table, baseIndex + postIdx, out ReadOnlySpan<byte> postName, out ReadOnlySpan<byte> postValue))
+                {
+                    return false;
+                }
+                input = input[postConsumed..];
+                request.AddField(postName, postValue);
+                continue;
+            }
+
+            {
+                // Literal With Post-Base Name Reference: 0000 N index(3+), then the value.
+                if (!TryReadInt(input, 3, out long postIdx, out int postConsumed) ||
+                    !TryResolve(table, baseIndex + postIdx, out ReadOnlySpan<byte> postName, out _))
+                {
+                    return false;
+                }
+
+                byte[] heldName = postName.ToArray();
+
+                input = input[postConsumed..];
+                if (!TryDecodeString(ref input, 7, out byte[] postValue, out int postLen))
+                {
+                    return false;
+                }
+                request.AddField(heldName, postValue.AsSpan(0, postLen));
+                ArrayPool<byte>.Shared.Return(postValue);
+                continue;
+            }
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Reconstruct the Required Insert Count from its wrapped encoding (RFC 9204 4.5.1.1). It is
+    /// sent modulo twice the table's entry capacity so it stays small, which has to be undone
+    /// against how many insertions we have actually seen.
+    /// </summary>
+    private static bool TryDecodeInsertCount(long encoded, QpackDynamicTable? table, int advertisedCapacity,
+        out long requiredInsertCount)
+    {
+        requiredInsertCount = 0;
+
+        if (encoded == 0)
+        {
+            return true;   // references nothing dynamic, which is always decodable
+        }
+
+        if (table is null)
+        {
+            return false;  // we advertised no table, so nothing may be referenced
+        }
+
+        long maxEntries = advertisedCapacity / 32;
+        if (maxEntries <= 0)
+        {
+            return false;
+        }
+
+        long fullRange = 2 * maxEntries;
+        if (encoded > fullRange)
+        {
+            return false;
+        }
+
+        long maxValue = table.InsertCount + maxEntries;
+        long maxWrapped = maxValue / fullRange * fullRange;
+
+        requiredInsertCount = maxWrapped + encoded - 1;
+
+        if (requiredInsertCount > maxValue)
+        {
+            if (requiredInsertCount <= fullRange)
+            {
+                return false;
+            }
+            requiredInsertCount -= fullRange;
+        }
+
+        if (requiredInsertCount == 0)
+        {
+            return false;
+        }
+
+        // Blocked references are refused rather than parked: we advertise 0 blocked streams, so a
+        // conforming peer never sends one.
+        return requiredInsertCount <= table.InsertCount;
+    }
+
+    private static bool TryResolve(QpackDynamicTable? table, long absoluteIndex,
+        out ReadOnlySpan<byte> name, out ReadOnlySpan<byte> value)
+    {
+        if (table is null || absoluteIndex < 0 || absoluteIndex > int.MaxValue)
+        {
+            name = default;
+            value = default;
+            return false;
+        }
+
+        return table.TryGet((int)absoluteIndex, out name, out value);
     }
 
     // A QPACK string: H bit ahead of an N-bit-prefix length, then bytes (Huffman-coded when H).

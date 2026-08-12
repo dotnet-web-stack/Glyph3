@@ -70,7 +70,15 @@ public sealed partial class Http3Connection
         public bool CollectingSettings;
         public byte[]? SettingsBuf;
         public int SettingsLen;
+
+        // The encoder stream carries instructions that can straddle reads, so a partial one is
+        // held here rather than dropped.
+        public bool IsEncoder;
+        public byte[]? Carry2;
+        public int Carry2Len;
     }
+
+    private const int MaxEncoderCarry = 4096;
 
     /// <summary>What the peer's SETTINGS said about QPACK. Both default to 0, which is also what a
     /// peer that sends no SETTINGS means.</summary>
@@ -78,20 +86,31 @@ public sealed partial class Http3Connection
 
     private long _peerBlockedStreams;
 
+    // Built from the peer's encoder stream when a capacity is advertised; null keeps the
+    // capacity-0 behaviour, where any dynamic reference is refused.
+    private QpackDynamicTable? _decodeTable;
+
+    private long _decoderStreamId = -1;
+
+    private int _acknowledgedInserts;
+
     private static Http3Options Validate(Http3Options? options)
     {
         Http3Options settled = options ?? Http3Options.Default;
 
-        // Advertising a capacity the decoder cannot honour would be worse than not offering it:
-        // conforming peers would send dynamic references this build refuses.
-        if (settled.DynamicTableEnabled)
+        // Blocked references are refused rather than parked, so offering the peer the chance to
+        // send one would just break connections.
+        if (settled.QpackBlockedStreams != 0)
         {
             throw new NotSupportedException(
-                "The QPACK dynamic table is not implemented yet; leave QpackDynamicTableCapacity at 0.");
+                "Blocked streams are not supported; leave QpackBlockedStreams at 0.");
         }
 
         return settled;
     }
+
+    private static QpackDynamicTable? CreateDecodeTable(Http3Options options)
+        => options.DynamicTableEnabled ? new QpackDynamicTable(options.QpackDynamicTableCapacity) : null;
 
     internal long PeerQpackCapacity() => _peerTableCapacity;
 
@@ -122,6 +141,7 @@ public sealed partial class Http3Connection
         _streamingHandler = handler;
         _streaming = true;
         _options = Validate(options);
+        _decodeTable = CreateDecodeTable(_options);
     }
 
     /// <summary>True once the connection has failed and can only be torn down.</summary>
@@ -241,16 +261,75 @@ public sealed partial class Http3Connection
         }
         _controlSent = true;
 
-        Span<byte> buf = stackalloc byte[16];
+        // The payload is built first so its length is measured rather than assumed. It was a
+        // constant 4 while both values were single-byte zeros, which silently truncated the frame
+        // the moment a real capacity was configured.
+        Span<byte> payload = stackalloc byte[32];
+        int p = 0;
+        p += Varint.Write(payload[p..], 0x1);    // QPACK_MAX_TABLE_CAPACITY
+        p += Varint.Write(payload[p..], _options.QpackDynamicTableCapacity);
+        p += Varint.Write(payload[p..], 0x7);    // QPACK_BLOCKED_STREAMS
+        p += Varint.Write(payload[p..], _options.QpackBlockedStreams);
+
+        Span<byte> buf = stackalloc byte[48];
         int w = 0;
-        w += Varint.Write(buf[w..], 0x00);   // stream type: control
-        w += Varint.Write(buf[w..], 0x4);    // SETTINGS
-        w += Varint.Write(buf[w..], 4);      //   length
-        w += Varint.Write(buf[w..], 0x1);    //   QPACK_MAX_TABLE_CAPACITY
-        w += Varint.Write(buf[w..], _options.QpackDynamicTableCapacity);
-        w += Varint.Write(buf[w..], 0x7);    //   QPACK_BLOCKED_STREAMS
-        w += Varint.Write(buf[w..], _options.QpackBlockedStreams);
+        w += Varint.Write(buf[w..], 0x00);       // stream type: control
+        w += Varint.Write(buf[w..], 0x4);        // SETTINGS
+        w += Varint.Write(buf[w..], p);          //   length
+        payload[..p].CopyTo(buf[w..]);
+        w += p;
+
         _transport.Send(ctrl, buf[..w], fin: false);
+
+        OpenDecoderStream();
+    }
+
+    /// <summary>
+    /// Our decoder stream, opened only when a table is advertised. Insert Count Increment travels
+    /// on it, and with 0 blocked streams the peer cannot use its table until those arrive.
+    /// </summary>
+    private void OpenDecoderStream()
+    {
+        if (!_options.DynamicTableEnabled || _decoderStreamId >= 0)
+        {
+            return;
+        }
+
+        long stream = _transport.OpenUniStream();
+        if (stream < 0)
+        {
+            return;   // retried on the next flush, like the control stream
+        }
+
+        _decoderStreamId = stream;
+
+        Span<byte> buf = stackalloc byte[8];
+        int w = Varint.Write(buf, 0x03);   // stream type: QPACK decoder
+        _transport.Send(stream, buf[..w], fin: false);
+    }
+
+    /// <summary>
+    /// Tell the peer how many insertions we have taken in. Without this a peer honouring 0 blocked
+    /// streams never references anything and the table compresses nothing.
+    /// </summary>
+    private void AcknowledgeInserts()
+    {
+        if (_decodeTable is null || _decoderStreamId < 0)
+        {
+            return;
+        }
+
+        int increment = _decodeTable.InsertCount - _acknowledgedInserts;
+        if (increment <= 0)
+        {
+            return;
+        }
+
+        _acknowledgedInserts = _decodeTable.InsertCount;
+
+        Span<byte> buf = stackalloc byte[8];
+        int w = QpackDecoderStream.WriteInsertCountIncrement(buf, increment);
+        _transport.Send(_decoderStreamId, buf[..w], fin: false);
     }
 
     // --- ingress -------------------------------------------------------------------------------
@@ -433,7 +512,8 @@ public sealed partial class Http3Connection
             return;
         }
 
-        if (!Qpack.TryDecodeFieldSection(rs.HeadersBuf.AsSpan(0, rs.HeadersLen), rs.Request))
+        if (!Qpack.TryDecodeFieldSection(rs.HeadersBuf.AsSpan(0, rs.HeadersLen), rs.Request,
+                _decodeTable, _options.QpackDynamicTableCapacity))
         {
             Fatal("malformed field section");
             return;
@@ -473,14 +553,41 @@ public sealed partial class Http3Connection
             }
             us.TypeKnown = true;
             us.IsControl = type == 0x00;
+            us.IsEncoder = type == 0x02 && _decodeTable is not null;
             int fromData = consumed - us.CarryLen;
             us.CarryLen = 0;
             data = data[fromData..];
         }
 
+        if (us.IsEncoder)
+        {
+            // The peer's encoder stream builds our decode table.
+            QpackEncoderStream.Result result =
+                QpackEncoderStream.Apply(ref data, _decodeTable!, _options.QpackDynamicTableCapacity);
+
+            if (result == QpackEncoderStream.Result.Error)
+            {
+                Fatal("malformed QPACK encoder instruction");
+                return;
+            }
+
+            // Whatever did not complete is kept for the next read.
+            us.Carry2 ??= new byte[MaxEncoderCarry];
+            if (data.Length > MaxEncoderCarry)
+            {
+                Fatal("oversized QPACK encoder instruction");
+                return;
+            }
+            data.CopyTo(us.Carry2);
+            us.Carry2Len = data.Length;
+
+            AcknowledgeInserts();
+            return;
+        }
+
         if (!us.IsControl)
         {
-            return;   // QPACK enc/dec, push, grease: drain (auto-credited - uni streams are never paced)
+            return;   // QPACK decoder, push, grease: drain (uni streams are never paced)
         }
 
         while (!data.IsEmpty && !_fatal)

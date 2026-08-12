@@ -122,16 +122,16 @@ public class Http3OptionsTests
     }
 
     [Fact]
-    public void ANonZeroCapacityIsRefusedWhileTheDecoderCannotHonourIt()
+    public void ANonZeroCapacityIsAccepted()
     {
-        // Advertising a table this build cannot decode would be worse than not offering one:
-        // conforming peers would send references it refuses.
         var transport = new NullTransport();
 
-        Assert.Throws<NotSupportedException>(() => new Http3Connection(
+        var connection = new Http3Connection(
             transport,
             _ => new Http3Response { Status = 200 },
-            new Http3Options { QpackDynamicTableCapacity = 4096 }));
+            new Http3Options { QpackDynamicTableCapacity = 4096 });
+
+        Assert.False(connection.IsFaulted);
     }
 
     [Fact]
@@ -167,5 +167,166 @@ public class Http3OptionsTests
         public long OpenUniStream() => 3;
 
         public void Send(long streamId, ReadOnlySpan<byte> data, bool fin) => Sent = data.ToArray();
+    }
+}
+
+/// <summary>
+/// The dial, end to end: capacity 0 must behave exactly as before, and a nonzero one must actually
+/// open the decoder stream and advertise itself.
+/// </summary>
+public class DynamicTableWiringTests
+{
+    [Fact]
+    public void CapacityZeroOpensOnlyTheControlStream()
+    {
+        var transport = new CountingTransport();
+
+        new Http3Connection(transport, _ => new Http3Response { Status = 200 }).Start();
+
+        Assert.Equal(1, transport.UniStreamsOpened);
+    }
+
+    [Fact]
+    public void ANonZeroCapacityAlsoOpensTheDecoderStream()
+    {
+        var transport = new CountingTransport();
+
+        new Http3Connection(transport, _ => new Http3Response { Status = 200 },
+            new Http3Options { QpackDynamicTableCapacity = 4096 }).Start();
+
+        Assert.Equal(2, transport.UniStreamsOpened);
+
+        // Stream type 0x03 announces it as the QPACK decoder stream.
+        Assert.Equal(0x03, transport.LastSent[0]);
+    }
+
+    [Fact]
+    public void TheAdvertisedCapacityReachesTheWire()
+    {
+        var transport = new CountingTransport();
+
+        new Http3Connection(transport, _ => new Http3Response { Status = 200 },
+            new Http3Options { QpackDynamicTableCapacity = 4096 }).Start();
+
+        // SETTINGS: ... 0x01 then 4096 as a 2-byte varint (0x50 0x00).
+        byte[] settings = transport.FirstSent;
+
+        Assert.Equal(0x01, settings[3]);
+        Assert.Equal(0x50, settings[4]);
+        Assert.Equal(0x00, settings[5]);
+    }
+
+    [Fact]
+    public void BlockedStreamsAboveZeroIsRefused()
+    {
+        // We refuse blocked references rather than parking them, so inviting the peer to send one
+        // would only break connections.
+        Assert.Throws<NotSupportedException>(() => new Http3Connection(
+            new CountingTransport(),
+            _ => new Http3Response { Status = 200 },
+            new Http3Options { QpackDynamicTableCapacity = 4096, QpackBlockedStreams = 16 }));
+    }
+
+    private sealed class CountingTransport : IHttp3Transport
+    {
+        private long _next = -1;
+
+        internal int UniStreamsOpened { get; private set; }
+
+        internal byte[] FirstSent { get; private set; } = [];
+
+        internal byte[] LastSent { get; private set; } = [];
+
+        public long OpenUniStream()
+        {
+            UniStreamsOpened++;
+            return _next += 4;
+        }
+
+        public void Send(long streamId, ReadOnlySpan<byte> data, bool fin)
+        {
+            if (FirstSent.Length == 0)
+            {
+                FirstSent = data.ToArray();
+            }
+            LastSent = data.ToArray();
+        }
+    }
+}
+
+/// <summary>
+/// The SETTINGS frame's own framing. Its length was a constant, correct only while every value was
+/// a single-byte zero, so configuring a real capacity truncated the frame and killed the
+/// connection - with nothing logged, because the peer simply gave up.
+/// </summary>
+public class SettingsFramingTests
+{
+    [Theory]
+    [InlineData(0)]
+    [InlineData(63)]      // last single-byte varint
+    [InlineData(64)]      // first two-byte varint
+    [InlineData(4096)]
+    [InlineData(16384)]   // first four-byte varint
+    public void TheDeclaredLengthMatchesThePayload(int capacity)
+    {
+        var transport = new CapturingTransport();
+
+        new Http3Connection(transport, _ => new Http3Response { Status = 200 },
+            new Http3Options { QpackDynamicTableCapacity = capacity }).Start();
+
+        byte[] sent = transport.First;
+
+        // stream type, frame type, then the length varint.
+        Assert.True(Varint.TryRead(sent.AsSpan(0), out long streamType, out int c0));
+        Assert.Equal(0x00, streamType);
+
+        Assert.True(Varint.TryRead(sent.AsSpan(c0), out long frameType, out int c1));
+        Assert.Equal(0x4, frameType);
+
+        Assert.True(Varint.TryRead(sent.AsSpan(c0 + c1), out long length, out int c2));
+
+        int payloadStart = c0 + c1 + c2;
+        Assert.Equal(sent.Length - payloadStart, length);
+    }
+
+    [Fact]
+    public void TheAdvertisedCapacityIsReadableBack()
+    {
+        var transport = new CapturingTransport();
+
+        new Http3Connection(transport, _ => new Http3Response { Status = 200 },
+            new Http3Options { QpackDynamicTableCapacity = 4096 }).Start();
+
+        byte[] sent = transport.First;
+
+        // Skip stream type, frame type and length, then read the identifier/value pairs.
+        Varint.TryRead(sent.AsSpan(0), out _, out int c0);
+        Varint.TryRead(sent.AsSpan(c0), out _, out int c1);
+        Varint.TryRead(sent.AsSpan(c0 + c1), out _, out int c2);
+
+        ReadOnlySpan<byte> payload = sent.AsSpan(c0 + c1 + c2);
+
+        Assert.True(Varint.TryRead(payload, out long id, out int i0));
+        Assert.Equal(0x1, id);
+
+        Assert.True(Varint.TryRead(payload[i0..], out long value, out _));
+        Assert.Equal(4096, value);
+    }
+
+    private sealed class CapturingTransport : IHttp3Transport
+    {
+        private long _next = -1;
+
+        internal byte[] First { get; private set; } = [];
+
+        public long OpenUniStream() => _next += 4;
+
+        public void Send(long streamId, ReadOnlySpan<byte> data, bool fin)
+        {
+            if (First.Length == 0)
+            {
+                First = data.ToArray();
+            }
+        }
     }
 }
