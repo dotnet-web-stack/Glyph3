@@ -1,5 +1,3 @@
-# Glyph3
-
 [![Glyph3](https://img.shields.io/nuget/v/Glyph3.svg?label=Glyph3)](https://www.nuget.org/packages/Glyph3/)
 ![.NET](https://img.shields.io/badge/.NET-8.0%20%7C%209.0%20%7C%2010.0-512bd4)
 
