@@ -1,0 +1,54 @@
+name: Release
+
+# Publishes the Glyph3 package at its csproj version. The push uses --skip-duplicate, so
+# re-running only publishes a version not already on NuGet.org - bump <Version> in
+# src/Glyph3/Glyph3.csproj and re-run to release.
+#
+# Needs a NUGET_API_KEY secret on the repository (Settings > Secrets and variables > Actions).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  managed:
+    name: Glyph3 (managed)
+
+    # Glyph3 is pure managed with no native assets, so there is no build matrix to satisfy and
+    # nothing platform-specific to pack on.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDKs
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: |
+            8.0
+            9.0
+            10.0
+
+      # The library only - the Playground sample is a consumer, not something to publish.
+      - name: Restore dependencies
+        run: dotnet restore src/Glyph3/Glyph3.csproj
+
+      - name: Build
+        run: dotnet build src/Glyph3/Glyph3.csproj --configuration Release --no-restore
+
+      - name: Pack
+        run: dotnet pack src/Glyph3/Glyph3.csproj --configuration Release -p:ContinuousIntegrationBuild=true --no-build --output ./artifacts
+
+      - name: List gathered packages
+        run: ls -l artifacts
+
+      - name: Publish packages to NuGet
+        working-directory: artifacts
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: dotnet nuget push '*.nupkg' -k "$NUGET_API_KEY" -s https://api.nuget.org/v3/index.json --skip-duplicate

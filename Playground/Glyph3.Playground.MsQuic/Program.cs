@@ -5,20 +5,8 @@ using System.Text;
 using Glyph3;
 using Glyph3.Playground.MsQuic;
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-//  An HTTP/3 server in pure managed C#: Glyph3 for HTTP/3, System.Net.Quic (MsQuic) for QUIC.
-//  No native code of its own, and nothing io_uring-shaped - it runs wherever MsQuic does.
-//
-//      dotnet run -c Release --project Playground/Glyph3.Playground.MsQuic
-//      curl --http3 -k https://127.0.0.1:8443/
-//
-//  QUIC needs libmsquic present. Windows ships it with the .NET runtime; on Linux install it
-//  (`sudo apt install libmsquic`), and on macOS `brew install libmsquic` plus
-//  DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib. QuicListener.IsSupported below is the check.
-//
 //  The whole bridge is MsQuicHttp3Connection - read QUIC streams into Glyph3, write what comes
 //  back. Everything above the transport is Glyph3's and would be identical over any other QUIC.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
 
 ushort port = ushort.TryParse(Environment.GetEnvironmentVariable("GLYPH3_PORT"), out ushort p) ? p : (ushort)8443;
 
@@ -36,6 +24,8 @@ var listener = await QuicListener.ListenAsync(new QuicListenerOptions
 {
     ListenEndPoint = new IPEndPoint(IPAddress.Loopback, port),
     ApplicationProtocols = [SslApplicationProtocol.Http3],
+    
+#pragma warning disable CA1416
     ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(new QuicServerConnectionOptions
     {
         DefaultStreamErrorCode = 0x010c,   // H3_REQUEST_CANCELLED
@@ -49,6 +39,7 @@ var listener = await QuicListener.ListenAsync(new QuicListenerOptions
             // and Glyph3 never sees it, because client authentication belongs to the transport.
         },
     }),
+#pragma warning restore CA1416
 });
 
 Console.WriteLine($"[glyph3-msquic] HTTP/3 on https://127.0.0.1:{port}/  (curl --http3 -k)");
