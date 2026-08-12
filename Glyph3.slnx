@@ -2,6 +2,9 @@
   <Folder Name="/src/">
     <Project Path="src/Glyph3/Glyph3.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Glyph3.Tests/Glyph3.Tests.csproj" />
+  </Folder>
   <Folder Name="/Playground/">
     <Project Path="Playground/Glyph3.Playground.MsQuic/Glyph3.Playground.MsQuic.csproj" />
   </Folder>

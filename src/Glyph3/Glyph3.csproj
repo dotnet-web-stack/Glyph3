@@ -36,4 +36,10 @@
         <None Include="../../README.md" Pack="true" PackagePath="/" />
     </ItemGroup>
 
+    <ItemGroup>
+        <!-- The QPACK internals and the frame parsers are driven directly by the tests: covering a
+             malformed field section through a QUIC connection is not practical. -->
+        <InternalsVisibleTo Include="Glyph3.Tests" />
+    </ItemGroup>
+
 </Project>

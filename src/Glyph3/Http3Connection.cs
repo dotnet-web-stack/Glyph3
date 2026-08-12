@@ -64,7 +64,23 @@ public sealed partial class Http3Connection
         // framed correctly); non-control uni streams are drained wholesale.
         public ParseState State = ParseState.FrameHeader;
         public long Remaining;
+
+        // SETTINGS payloads are accumulated so their values can be read; every other frame type is
+        // still walked for framing and discarded.
+        public bool CollectingSettings;
+        public byte[]? SettingsBuf;
+        public int SettingsLen;
     }
+
+    /// <summary>What the peer's SETTINGS said about QPACK. Both default to 0, which is also what a
+    /// peer that sends no SETTINGS means.</summary>
+    private long _peerTableCapacity;
+
+    private long _peerBlockedStreams;
+
+    internal long PeerQpackCapacity() => _peerTableCapacity;
+
+    internal long PeerQpackBlockedStreams() => _peerBlockedStreams;
 
     private Func<Http3Request, Http3Response>? _buffered;
     private Func<Http3Request, ValueTask<Http3Response>>? _streamingHandler;
@@ -453,7 +469,7 @@ public sealed partial class Http3Connection
                 int take = Math.Min(us.Carry.Length - us.CarryLen, data.Length);
                 data[..take].CopyTo(us.Carry.AsSpan(us.CarryLen));
                 int have = us.CarryLen + take;
-                if (!Varint.TryRead(us.Carry.AsSpan(0, have), out _, out int c1) ||
+                if (!Varint.TryRead(us.Carry.AsSpan(0, have), out long frameType, out int c1) ||
                     !Varint.TryRead(us.Carry.AsSpan(c1, have - c1), out long len, out int c2))
                 {
                     if (have == us.Carry.Length)
@@ -468,15 +484,38 @@ public sealed partial class Http3Connection
                 us.CarryLen = 0;
                 data = data[fromData..];
                 us.State = len == 0 ? ParseState.FrameHeader : ParseState.Skip;
-                us.Remaining = len;   // SETTINGS/GOAWAY/MAX_PUSH_ID payloads: parsed as framing, values ignored
+                us.Remaining = len;
+
+                // SETTINGS is the one control frame whose values matter: the peer's QPACK limits
+                // decide whether responses may use a dynamic table at all. Everything else is
+                // walked for framing and dropped.
+                us.CollectingSettings = frameType == 0x4 && len is > 0 and <= MaxSettingsBytes;
+                if (us.CollectingSettings)
+                {
+                    us.SettingsBuf ??= new byte[MaxSettingsBytes];
+                    us.SettingsLen = 0;
+                }
             }
             else
             {
                 int take = (int)Math.Min(us.Remaining, data.Length);
+
+                if (us.CollectingSettings)
+                {
+                    data[..take].CopyTo(us.SettingsBuf.AsSpan(us.SettingsLen));
+                    us.SettingsLen += take;
+                }
+
                 us.Remaining -= take;
                 data = data[take..];
+
                 if (us.Remaining == 0)
                 {
+                    if (us.CollectingSettings)
+                    {
+                        ApplyPeerSettings(us.SettingsBuf.AsSpan(0, us.SettingsLen));
+                        us.CollectingSettings = false;
+                    }
                     us.State = ParseState.FrameHeader;
                 }
             }
@@ -487,6 +526,41 @@ public sealed partial class Http3Connection
             _unis.Remove(sid);
         }
     }
+
+    /// <summary>
+    /// Read the peer's SETTINGS: identifier/value varint pairs. Unknown identifiers are ignored, as
+    /// the RFC requires - that is what makes the greased ones harmless.
+    /// </summary>
+    private void ApplyPeerSettings(ReadOnlySpan<byte> payload)
+    {
+        while (!payload.IsEmpty)
+        {
+            if (!Varint.TryRead(payload, out long id, out int idLen))
+            {
+                return;
+            }
+            payload = payload[idLen..];
+
+            if (!Varint.TryRead(payload, out long value, out int valueLen))
+            {
+                return;
+            }
+            payload = payload[valueLen..];
+
+            switch (id)
+            {
+                case 0x1:   // QPACK_MAX_TABLE_CAPACITY
+                    _peerTableCapacity = value;
+                    break;
+
+                case 0x7:   // QPACK_BLOCKED_STREAMS
+                    _peerBlockedStreams = value;
+                    break;
+            }
+        }
+    }
+
+    private const int MaxSettingsBytes = 256;
 
     // --- dispatch ------------------------------------------------------------------------------
 

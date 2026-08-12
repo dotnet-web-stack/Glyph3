@@ -29,7 +29,5 @@ jobs:
           9.0
           10.0
 
-    # Glyph3 has no test project yet - once it does, this becomes `dotnet test`, the way
-    # Glyph11's build workflow runs.
-    - name: Build
-      run: dotnet build Glyph3.slnx --configuration Release
+    - name: Test
+      run: dotnet test Glyph3.slnx --configuration Release
