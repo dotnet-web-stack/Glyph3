@@ -175,6 +175,17 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
                         {
                             stream.CompleteWrites();
                         }
+
+                        // A finished request stream must be released, or its credit is never
+                        // returned and the peer stalls after MaxInboundBidirectionalStreams
+                        // requests. Unidirectional streams are the control and QPACK streams and
+                        // live as long as the connection.
+                        if (item.Fin && (item.StreamId & 0x3) == 0x0 && _streams.TryRemove(item.StreamId, out QuicStream? finished))
+                        {
+                            // Off the writer: tearing a stream down is slow enough that awaiting it
+                            // here serialises every other request behind it.
+                            _ = finished.DisposeAsync().AsTask();
+                        }
                     }
                     ArrayPool<byte>.Shared.Return(item.Buffer);
                 }
