@@ -42,26 +42,34 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
     public static async Task ServeAsync(
         QuicConnection quic,
         Func<Http3Request, Http3Response> handler,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Http3Options? options = null,
+        Action<Http3Connection>? onConnection = null)
     {
         await using var bridge = new MsQuicHttp3Connection(quic);
-        await bridge.RunAsync(handler, cancellationToken);
+        await bridge.RunAsync(handler, cancellationToken, options, onConnection);
     }
 
-    private async Task RunAsync(Func<Http3Request, Http3Response> handler, CancellationToken cancellationToken)
+    private async Task RunAsync(Func<Http3Request, Http3Response> handler, CancellationToken cancellationToken,
+        Http3Options? options, Action<Http3Connection>? onConnection)
     {
-        // Opened before Glyph3 exists, because OpenUniStream answers synchronously. One is enough:
-        // Glyph3 asks for a single unidirectional stream, for control and SETTINGS. The QPACK
-        // encoder and decoder streams HTTP/3 also defines are unused while the dynamic table
-        // capacity is 0.
-        for (int i = 0; i < 1; i++)
+        // Opened before Glyph3 exists, because OpenUniStream answers synchronously. One is enough
+        // while the dynamic table capacity is 0: Glyph3 asks for a single unidirectional stream, for
+        // control and SETTINGS. With a capacity it also wants the QPACK encoder and decoder streams.
+        int uniStreams = (options?.QpackDynamicTableCapacity ?? 0) > 0 ? 3 : 1;
+
+        for (int i = 0; i < uniStreams; i++)
         {
             QuicStream uni = await _quic.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, cancellationToken);
             _streams[uni.Id] = uni;
             _spareUniStreams.Enqueue(uni);
         }
 
-        _h3 = new Http3Connection(this, handler);
+        _h3 = new Http3Connection(this, handler, options);
+
+        // Handed over while the connection is live, so its QPACK counters can be watched rather than
+        // read once it is already gone.
+        onConnection?.Invoke(_h3);
 
         Task accepting = AcceptStreamsAsync(cancellationToken);
         Task writing = WriteLoopAsync(cancellationToken);

@@ -123,6 +123,28 @@ public sealed partial class Http3Connection
 
     internal long PeerQpackBlockedStreams() => _peerBlockedStreams;
 
+    /// <summary>
+    /// What the peer's SETTINGS advertised as its QPACK dynamic table capacity, in bytes.
+    /// </summary>
+    /// <remarks>
+    /// This is the peer's DECODER limit, so it caps what this connection may insert when encoding
+    /// responses. Zero - which most deployed clients send - means the dynamic table is unusable
+    /// outbound no matter what capacity was configured locally.
+    /// </remarks>
+    public long PeerDynamicTableCapacity => _peerTableCapacity;
+
+    /// <summary>
+    /// Entries the peer has inserted into the table used to decode its requests. Stays 0 when the
+    /// peer never uses the dynamic table, which is the common case.
+    /// </summary>
+    public int InboundDynamicInserts => _decodeTable?.InsertCount ?? 0;
+
+    /// <summary>
+    /// Entries inserted into the table used to encode responses. Stays 0 when the peer advertised
+    /// no capacity, since there would be nowhere for it to store them.
+    /// </summary>
+    public int OutboundDynamicInserts => _encoder?.InsertCount ?? 0;
+
     private readonly Http3Options _options = Http3Options.Default;
 
     private Func<Http3Request, Http3Response>? _buffered;
