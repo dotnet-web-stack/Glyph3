@@ -1,0 +1,733 @@
+using System.Buffers;
+
+
+namespace Glyph3;
+
+/// <summary>
+/// HTTP/3 over any QUIC transport, implemented entirely in C# - frame parsing,
+/// QPACK (static table + Huffman) and request dispatch, no native dependencies. The public
+/// surface comes in two flavours: buffered (dispatch at end-of-stream,
+/// body pre-assembled) and a streaming overload (dispatch at end-of-headers, body pulled through
+/// <see cref="Http3Request.BodyReader"/> while the request stream is flow-control paced).
+///
+/// Our SETTINGS advertise QPACK dynamic-table capacity 0, which pins conforming peers to
+/// static-table references and literals - the entire decoder surface this library implements.
+/// Calls must be serialised by the host; wakes for parked body reads are deferred to the end of
+/// each Flush (fire-after-unwind: a wake never runs inside a parse).
+/// </summary>
+public sealed partial class Http3Connection
+{
+    private readonly IHttp3Transport _transport;
+    private bool _fatal;
+    private bool _streaming;
+    private bool _controlSent;
+
+    // Per-stream ingress state, keyed by stream id. Client bidi (id % 4 == 0) = request streams;
+    // client uni (id % 4 == 2) = control / QPACK / push streams.
+    private readonly Dictionary<long, ReqStream> _requests = new();
+    private readonly Dictionary<long, UniStream> _unis = new();
+    private readonly List<long> _ready = [];
+    private readonly List<Http3BodyReader> _bodyWakes = [];
+
+    private const long FrameData = 0x0;
+    private const long FrameHeaders = 0x1;
+    private const int MaxHeaderSection = 64 * 1024;
+
+    private enum ParseState : byte
+    {
+        FrameHeader,     // accumulating the type+length varints
+        HeadersPayload,  // accumulating an encoded field section
+        DataPayload,     // streaming DATA payload through
+        Skip,            // draining an unknown/greased frame
+    }
+
+    private sealed class ReqStream
+    {
+        public readonly Http3Request Request = new();
+        public Http3BodyReader? Sink;
+
+        public ParseState State = ParseState.FrameHeader;
+        public readonly byte[] Carry = new byte[16];   // partial frame-header varints across chunks
+        public int CarryLen;
+        public long Remaining;                          // payload bytes left in the current frame
+
+        public byte[]? HeadersBuf;                      // pooled accumulation for a HEADERS frame
+        public int HeadersLen;
+
+        public bool HeadersDone;                        // first HEADERS decoded (later ones = trailers)
+        public bool Dispatched;                         // streaming: handler already started
+        public bool Finished;                           // fin seen and processed
+    }
+
+    private sealed class UniStream
+    {
+        public bool TypeKnown;
+        public bool IsControl;
+        public readonly byte[] Carry = new byte[16];
+        public int CarryLen;
+        // Control-stream frame walk (SETTINGS and friends are parsed-and-ignored, but must be
+        // framed correctly); non-control uni streams are drained wholesale.
+        public ParseState State = ParseState.FrameHeader;
+        public long Remaining;
+    }
+
+    private Func<Http3Request, Http3Response>? _buffered;
+    private Func<Http3Request, ValueTask<Http3Response>>? _streamingHandler;
+
+    /// <summary>
+    /// Buffered flavour: the handler is called at end-of-stream with the whole body already in
+    /// <see cref="Http3Request.Body"/>.
+    /// </summary>
+    public Http3Connection(IHttp3Transport transport, Func<Http3Request, Http3Response> handler)
+    {
+        _transport = transport;
+        _buffered = handler;
+        _streaming = false;
+    }
+
+    /// <summary>
+    /// Streaming flavour: the handler is called at END-OF-HEADERS and pulls the body through
+    /// <see cref="Http3Request.BodyReader"/> while it arrives.
+    /// </summary>
+    public Http3Connection(IHttp3Transport transport, Func<Http3Request, ValueTask<Http3Response>> handler)
+    {
+        _transport = transport;
+        _streamingHandler = handler;
+        _streaming = true;
+    }
+
+    /// <summary>True once the connection has failed and can only be torn down.</summary>
+    public bool IsFaulted => _fatal;
+
+    /// <summary>
+    /// Open the control stream and send SETTINGS. Optional: <see cref="Flush"/> does it on the
+    /// first pass anyway, because a transport may not be able to open a unidirectional stream
+    /// before its handshake completes.
+    /// </summary>
+    public void Start()
+    {
+        if (!_controlSent && !_fatal)
+        {
+            SendControlStream();
+        }
+    }
+
+    /// <summary>
+    /// Hand Glyph3 bytes that arrived on a stream. Parses only - nothing is dispatched until
+    /// <see cref="Flush"/>, so a host that receives in batches can feed the whole batch and
+    /// dispatch once.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="data"/> is borrowed for the duration of the call; Glyph3 copies whatever it
+    /// needs to keep. The caller may reuse or release the memory as soon as this returns.
+    /// </remarks>
+    public void Feed(long streamId, ReadOnlySpan<byte> data, bool fin)
+    {
+        if (_fatal)
+        {
+            return;
+        }
+
+        // Unidirectional: control, QPACK encoder/decoder, push.
+        if ((streamId & 0x3) == 0x2)
+        {
+            FeedUni(streamId, data, fin);
+            return;
+        }
+
+        // Server-initiated ids never carry data from the peer.
+        if ((streamId & 0x3) != 0x0)
+        {
+            return;
+        }
+
+        if (!_requests.TryGetValue(streamId, out ReqStream? rs))
+        {
+            if (fin && data.Length == 0)
+            {
+                return;   // empty stream - there is nothing to answer
+            }
+            rs = new ReqStream();
+            rs.Request.StreamId = streamId;
+            _requests[streamId] = rs;
+        }
+
+        FeedRequest(streamId, rs, data, fin);
+    }
+
+    /// <summary>
+    /// A stream ended without delivering data - reset, stop-sending, or the connection dropping it.
+    /// Any half-parsed request on it is abandoned.
+    /// </summary>
+    public void OnStreamClosed(long streamId)
+    {
+        if (_requests.Remove(streamId, out ReqStream? dead))
+        {
+            dead.Sink?.End();
+            ReleaseParseBuffers(dead);
+        }
+        _unis.Remove(streamId);
+    }
+
+    /// <summary>
+    /// Wake parked body reads and dispatch whatever became complete. Call once after a batch of
+    /// <see cref="Feed"/> calls; calling it per chunk is correct too, just more often.
+    /// </summary>
+    public void Flush()
+    {
+        if (_fatal)
+        {
+            return;
+        }
+
+        // A transport may refuse to open a unidirectional stream before its handshake finishes, so
+        // this is retried until it takes rather than being a one-shot at construction.
+        if (!_controlSent)
+        {
+            SendControlStream();
+        }
+
+        FireBodyWakes();
+
+        if (_streaming)
+        {
+            DispatchReadyStreaming(_streamingHandler!);
+        }
+        else
+        {
+            DispatchReady(_buffered!);
+        }
+    }
+
+    /// <summary>
+    /// Tear the connection down: abandon half-parsed requests and release parked body readers, so
+    /// a handler awaiting a body that will never arrive is not left hanging.
+    /// </summary>
+    public void Close()
+    {
+        foreach (ReqStream rs in _requests.Values)
+        {
+            rs.Sink?.Drop();
+            ReleaseParseBuffers(rs);
+        }
+        FireBodyWakes();
+        _requests.Clear();
+    }
+
+    // Our control stream: stream type 0x00, then SETTINGS pinning the QPACK dynamic table to 0
+    // (QPACK_MAX_TABLE_CAPACITY = 0, QPACK_BLOCKED_STREAMS = 0) - the contract the decoder relies on.
+    private void SendControlStream()
+    {
+        long ctrl = _transport.OpenUniStream();
+        if (ctrl < 0)
+        {
+            return;   // pre-handshake wake: uni streams aren't openable yet - retry next pass
+        }
+        _controlSent = true;
+
+        Span<byte> buf = stackalloc byte[16];
+        int w = 0;
+        w += Varint.Write(buf[w..], 0x00);   // stream type: control
+        w += Varint.Write(buf[w..], 0x4);    // SETTINGS
+        w += Varint.Write(buf[w..], 4);      //   length
+        w += Varint.Write(buf[w..], 0x1);    //   QPACK_MAX_TABLE_CAPACITY
+        w += Varint.Write(buf[w..], 0);      //     = 0
+        w += Varint.Write(buf[w..], 0x7);    //   QPACK_BLOCKED_STREAMS
+        w += Varint.Write(buf[w..], 0);      //     = 0
+        _transport.Send(ctrl, buf[..w], fin: false);
+    }
+
+    // --- ingress -------------------------------------------------------------------------------
+
+    private void FeedRequest(long sid, ReqStream rs, ReadOnlySpan<byte> data, bool fin)
+    {
+        // Bytes the parser consumes that are NOT handed to the body sink (frame headers, HEADERS
+        // payload, trailers, grease) credit the flow-control window immediately once the stream is
+        // paced; sink bytes credit as the handler pulls them.
+        int immediateCredit = 0;
+
+        while (!data.IsEmpty && !_fatal)
+        {
+            switch (rs.State)
+            {
+                case ParseState.FrameHeader:
+                {
+                    int take = Math.Min(rs.Carry.Length - rs.CarryLen, data.Length);
+                    data[..take].CopyTo(rs.Carry.AsSpan(rs.CarryLen));
+                    int have = rs.CarryLen + take;
+
+                    if (!Varint.TryRead(rs.Carry.AsSpan(0, have), out long type, out int c1) ||
+                        !Varint.TryRead(rs.Carry.AsSpan(c1, have - c1), out long len, out int c2))
+                    {
+                        if (have == rs.Carry.Length)
+                        {
+                            Fatal("oversized frame header");
+                            return;
+                        }
+                        rs.CarryLen = have;
+                        if (rs.Sink is not null)
+                        {
+                            immediateCredit += take;
+                        }
+                        data = data[take..];
+                        continue;
+                    }
+
+                    int headerBytes = c1 + c2;
+                    int fromData = headerBytes - rs.CarryLen;   // header bytes consumed from THIS chunk
+                    rs.CarryLen = 0;
+                    if (rs.Sink is not null)
+                    {
+                        immediateCredit += fromData;
+                    }
+                    data = data[fromData..];
+
+                    if (type == FrameData)
+                    {
+                        if (!rs.HeadersDone)
+                        {
+                            Fatal("DATA before HEADERS");
+                            return;
+                        }
+                        rs.State = len == 0 ? ParseState.FrameHeader : ParseState.DataPayload;
+                        rs.Remaining = len;
+                    }
+                    else if (type == FrameHeaders)
+                    {
+                        if (len > MaxHeaderSection)
+                        {
+                            Fatal("header section too large");
+                            return;
+                        }
+                        rs.HeadersBuf = ArrayPool<byte>.Shared.Rent((int)len);
+                        rs.HeadersLen = 0;
+                        rs.State = ParseState.HeadersPayload;
+                        rs.Remaining = len;
+                        if (len == 0)
+                        {
+                            Fatal("empty HEADERS frame");
+                            return;
+                        }
+                    }
+                    else if (type is 0x3 or 0x4 or 0x5 or 0x7 or 0xD)
+                    {
+                        Fatal($"frame 0x{type:x} unexpected on a request stream");
+                        return;
+                    }
+                    else
+                    {
+                        rs.State = len == 0 ? ParseState.FrameHeader : ParseState.Skip;   // grease
+                        rs.Remaining = len;
+                    }
+                    break;
+                }
+
+                case ParseState.HeadersPayload:
+                {
+                    int take = (int)Math.Min(rs.Remaining, data.Length);
+                    data[..take].CopyTo(rs.HeadersBuf.AsSpan(rs.HeadersLen));
+                    rs.HeadersLen += take;
+                    rs.Remaining -= take;
+                    if (rs.Sink is not null)
+                    {
+                        immediateCredit += take;
+                    }
+                    data = data[take..];
+
+                    if (rs.Remaining == 0)
+                    {
+                        OnHeadersComplete(sid, rs);
+                        ArrayPool<byte>.Shared.Return(rs.HeadersBuf!);
+                        rs.HeadersBuf = null;
+                        rs.State = ParseState.FrameHeader;
+                    }
+                    break;
+                }
+
+                case ParseState.DataPayload:
+                {
+                    int take = (int)Math.Min(rs.Remaining, data.Length);
+                    if (rs.Sink is not null)
+                    {
+                        rs.Sink.Push(data[..take]);   // credited on hand-out, not here
+                    }
+                    else
+                    {
+                        rs.Request.BodyBuffer ??= new MemoryStream();
+                        rs.Request.BodyBuffer.Write(data[..take]);
+                    }
+                    rs.Remaining -= take;
+                    data = data[take..];
+                    if (rs.Remaining == 0)
+                    {
+                        rs.State = ParseState.FrameHeader;
+                    }
+                    break;
+                }
+
+                case ParseState.Skip:
+                {
+                    int take = (int)Math.Min(rs.Remaining, data.Length);
+                    rs.Remaining -= take;
+                    if (rs.Sink is not null)
+                    {
+                        immediateCredit += take;
+                    }
+                    data = data[take..];
+                    if (rs.Remaining == 0)
+                    {
+                        rs.State = ParseState.FrameHeader;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (immediateCredit > 0)
+        {
+            _transport.ReleaseFlowControl(sid, immediateCredit);
+        }
+
+        if (fin && !_fatal && !rs.Finished)
+        {
+            if (rs.State != ParseState.FrameHeader || rs.CarryLen != 0)
+            {
+                Fatal("stream ended mid-frame");
+                return;
+            }
+            rs.Finished = true;
+
+            if (_streaming)
+            {
+                rs.Sink?.End();
+            }
+            else if (rs.HeadersDone)
+            {
+                _ready.Add(sid);
+            }
+        }
+    }
+
+    // First HEADERS frame = the request's field section; later ones are trailers (validated by the
+    // frame walk, contents dropped - nothing in the surface carries them yet).
+    private void OnHeadersComplete(long sid, ReqStream rs)
+    {
+        if (rs.HeadersDone)
+        {
+            return;
+        }
+
+        if (!Qpack.TryDecodeFieldSection(rs.HeadersBuf.AsSpan(0, rs.HeadersLen), rs.Request))
+        {
+            Fatal("malformed field section");
+            return;
+        }
+        rs.HeadersDone = true;
+
+        if (_streaming && !rs.Dispatched)
+        {
+            rs.Dispatched = true;
+            var sink = new Http3BodyReader(this, sid, ended: false);
+            rs.Sink = sink;
+            rs.Request.BodyReader = sink;
+            _transport.SetStreamPaced(sid, true);
+            _ready.Add(sid);
+        }
+    }
+
+    // Client uni streams: type varint, then control-stream frames (parsed, ignored) or a plain
+    // drain for QPACK/push/greased types - with capacity 0 the QPACK streams carry nothing we need.
+    private void FeedUni(long sid, ReadOnlySpan<byte> data, bool fin)
+    {
+        if (!_unis.TryGetValue(sid, out UniStream? us))
+        {
+            us = new UniStream();
+            _unis[sid] = us;
+        }
+
+        if (!us.TypeKnown)
+        {
+            int take = Math.Min(us.Carry.Length - us.CarryLen, data.Length);
+            data[..take].CopyTo(us.Carry.AsSpan(us.CarryLen));
+            int have = us.CarryLen + take;
+            if (!Varint.TryRead(us.Carry.AsSpan(0, have), out long type, out int consumed))
+            {
+                us.CarryLen = have;
+                return;
+            }
+            us.TypeKnown = true;
+            us.IsControl = type == 0x00;
+            int fromData = consumed - us.CarryLen;
+            us.CarryLen = 0;
+            data = data[fromData..];
+        }
+
+        if (!us.IsControl)
+        {
+            return;   // QPACK enc/dec, push, grease: drain (auto-credited - uni streams are never paced)
+        }
+
+        while (!data.IsEmpty && !_fatal)
+        {
+            if (us.State == ParseState.FrameHeader)
+            {
+                int take = Math.Min(us.Carry.Length - us.CarryLen, data.Length);
+                data[..take].CopyTo(us.Carry.AsSpan(us.CarryLen));
+                int have = us.CarryLen + take;
+                if (!Varint.TryRead(us.Carry.AsSpan(0, have), out _, out int c1) ||
+                    !Varint.TryRead(us.Carry.AsSpan(c1, have - c1), out long len, out int c2))
+                {
+                    if (have == us.Carry.Length)
+                    {
+                        Fatal("oversized control frame header");
+                        return;
+                    }
+                    us.CarryLen = have;
+                    return;
+                }
+                int fromData = c1 + c2 - us.CarryLen;
+                us.CarryLen = 0;
+                data = data[fromData..];
+                us.State = len == 0 ? ParseState.FrameHeader : ParseState.Skip;
+                us.Remaining = len;   // SETTINGS/GOAWAY/MAX_PUSH_ID payloads: parsed as framing, values ignored
+            }
+            else
+            {
+                int take = (int)Math.Min(us.Remaining, data.Length);
+                us.Remaining -= take;
+                data = data[take..];
+                if (us.Remaining == 0)
+                {
+                    us.State = ParseState.FrameHeader;
+                }
+            }
+        }
+
+        if (fin)
+        {
+            _unis.Remove(sid);
+        }
+    }
+
+    // --- dispatch ------------------------------------------------------------------------------
+
+    private void DispatchReady(Func<Http3Request, Http3Response> handler)
+    {
+        for (int i = 0; i < _ready.Count && !_fatal; i++)
+        {
+            if (!_requests.Remove(_ready[i], out ReqStream? rs))
+            {
+                continue;
+            }
+            rs.Request.Freeze();
+
+            if (TryDispatchStreamedResponse(rs.Request))
+            {
+                continue;   // the writer owns this stream now
+            }
+
+            Http3Response resp;
+            try
+            {
+                resp = handler(rs.Request);
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"[glyph3] request handler faulted: {e.GetBaseException().Message}");
+                resp = new Http3Response { Status = 500 };
+            }
+
+            Submit(rs.Request.StreamId, resp);
+        }
+        _ready.Clear();
+    }
+
+    private void DispatchReadyStreaming(Func<Http3Request, ValueTask<Http3Response>> handler)
+    {
+        for (int i = 0; i < _ready.Count && !_fatal; i++)
+        {
+            long sid = _ready[i];
+            if (!_requests.TryGetValue(sid, out ReqStream? rs))
+            {
+                continue;
+            }
+            rs.Request.Freeze();
+
+            ValueTask<Http3Response> pending;
+            try
+            {
+                pending = handler(rs.Request);
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"[glyph3] request handler faulted: {e.GetBaseException().Message}");
+                Submit(sid, new Http3Response { Status = 500 });
+                continue;
+            }
+
+            if (pending.IsCompletedSuccessfully)
+            {
+                Submit(sid, pending.Result);
+            }
+            else
+            {
+                _ = CompleteStreamingAsync(pending, sid);
+            }
+        }
+        _ready.Clear();
+    }
+
+    private async Task CompleteStreamingAsync(ValueTask<Http3Response> pending, long streamId)
+    {
+        Http3Response resp;
+        try
+        {
+            resp = await pending;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[glyph3] request handler faulted: {e.GetBaseException().Message}");
+            resp = new Http3Response { Status = 500 };
+        }
+
+        if (_fatal)
+        {
+            return;
+        }
+        Submit(streamId, resp);
+    }
+
+    // --- egress --------------------------------------------------------------------------------
+
+    // Encode and send one response: HEADERS frame (+ DATA frame header) in one SendStream call,
+    // the body (with fin) in a second - the engine copies into its retention chunks either way.
+    private void Submit(long streamId, Http3Response resp)
+    {
+        if (resp.HeadIsValid)
+        {
+            SendSubmitted(streamId, resp, resp.EncodedHead!, resp.EncodedHeadLen);
+            return;
+        }
+
+        byte[] fields = Qpack.EncodeResponseFields(resp, out int fieldsLen);
+
+        bool hasContentLength = false;
+        foreach ((ReadOnlyMemory<byte> name, _) in resp.Headers)
+        {
+            hasContentLength |= name.Span.SequenceEqual("content-length"u8);
+        }
+
+        byte[] head = ArrayPool<byte>.Shared.Rent(fieldsLen + 64);
+        int w = 0;
+
+        if (!hasContentLength && resp.Body.Length > 0)
+        {
+            // content-length appended into the field section: re-encode is overkill, so it rides
+            // as an extra literal at the end of the same section buffer.
+            Span<byte> digits = stackalloc byte[20];
+            System.Buffers.Text.Utf8Formatter.TryFormat(resp.Body.Length, digits, out int dlen);
+            Span<byte> extra = stackalloc byte[32];
+            int e = Qpack.WriteInt(extra, 0x50, 4, 4);          // literal w/ name ref: content-length (idx 4)
+            e += Qpack.WriteInt(extra[e..], 0x00, 7, dlen);
+            digits[..dlen].CopyTo(extra[e..]);
+            e += dlen;
+
+            w += Varint.Write(head.AsSpan(w), FrameHeaders);
+            w += Varint.Write(head.AsSpan(w), fieldsLen + e);
+            fields.AsSpan(0, fieldsLen).CopyTo(head.AsSpan(w));
+            w += fieldsLen;
+            extra[..e].CopyTo(head.AsSpan(w));
+            w += e;
+        }
+        else
+        {
+            w += Varint.Write(head.AsSpan(w), FrameHeaders);
+            w += Varint.Write(head.AsSpan(w), fieldsLen);
+            fields.AsSpan(0, fieldsLen).CopyTo(head.AsSpan(w));
+            w += fieldsLen;
+        }
+        ArrayPool<byte>.Shared.Return(fields);
+
+        if (resp.Body.Length > 0)
+        {
+            w += Varint.Write(head.AsSpan(w), FrameData);
+            w += Varint.Write(head.AsSpan(w), resp.Body.Length);
+        }
+
+        // Keep it: this exact byte sequence is what every later request with this response needs.
+        // Not pooled - it outlives the call by design.
+        resp.EncodedHead = head.AsSpan(0, w).ToArray();
+        resp.EncodedHeadLen = w;
+        resp.EncodedForStatus = resp.Status;
+        resp.EncodedForHeaderCount = resp.Headers.Count;
+        resp.EncodedForBodyLength = resp.Body.Length;
+        ArrayPool<byte>.Shared.Return(head);
+
+        SendSubmitted(streamId, resp, resp.EncodedHead, w);
+    }
+
+    // Small bodies ride WITH the head in one send. Two SendStream calls cost two trips through
+    // the QUIC send path per response, which on a short response is a large share of the work;
+    // one extra copy of a few hundred bytes is cheaper. Large bodies still go on their own,
+    // because copying them would cost more than the second call saves.
+    private const int InlineBodyLimit = 4 * 1024;
+
+    private void SendSubmitted(long streamId, Http3Response resp, byte[] head, int headLen)
+    {
+        if (resp.Body.Length == 0)
+        {
+            _transport.Send(streamId, head.AsSpan(0, headLen), fin: true);
+            return;
+        }
+
+        if (resp.Body.Length <= InlineBodyLimit)
+        {
+            int total = headLen + resp.Body.Length;
+            byte[] one = ArrayPool<byte>.Shared.Rent(total);
+            head.AsSpan(0, headLen).CopyTo(one);
+            resp.Body.Span.CopyTo(one.AsSpan(headLen));
+            _transport.Send(streamId, one.AsSpan(0, total), fin: true);
+            ArrayPool<byte>.Shared.Return(one);
+            return;
+        }
+
+        _transport.Send(streamId, head.AsSpan(0, headLen), fin: false);
+        _transport.Send(streamId, resp.Body.Span, fin: true);
+    }
+
+    // --- streaming plumbing --------------------------------------------------------------------
+
+    internal void CreditBody(long streamId, int bytes) => _transport.ReleaseFlowControl(streamId, bytes);
+
+    internal void NoteBodyWake(Http3BodyReader sink)
+    {
+        if (!_bodyWakes.Contains(sink))
+        {
+            _bodyWakes.Add(sink);
+        }
+    }
+
+    private void FireBodyWakes()
+    {
+        for (int i = 0; i < _bodyWakes.Count; i++)
+        {
+            _bodyWakes[i].FireIfReady();
+        }
+        _bodyWakes.Clear();
+    }
+
+    private void Fatal(string reason)
+    {
+        Console.Error.WriteLine($"[glyph3] protocol error: {reason}");
+        _fatal = true;
+    }
+
+    private static void ReleaseParseBuffers(ReqStream rs)
+    {
+        if (rs.HeadersBuf is not null)
+        {
+            ArrayPool<byte>.Shared.Return(rs.HeadersBuf);
+            rs.HeadersBuf = null;
+        }
+    }
+}

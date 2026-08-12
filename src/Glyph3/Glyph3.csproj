@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <RootNamespace>Glyph3</RootNamespace>
+
+        <!-- The response writer uses an unsafe block inside an async method - a C# 13 relaxation.
+             It is a compiler feature only, so targeting net8.0 with it is fine. -->
+        <LangVersion>13.0</LangVersion>
+
+        <PackageId>Glyph3</PackageId>
+        <AssemblyVersion>0.1.0.0</AssemblyVersion>
+        <FileVersion>0.1.0.0</FileVersion>
+        <Version>0.1.0</Version>
+        <Authors>dotnet-web-stack</Authors>
+        <Description>A transport-agnostic HTTP/3 connection for .NET: frame parsing, QPACK (static table and Huffman) and request dispatch, in pure managed C# with no native dependencies. Glyph3 does no I/O - it takes stream bytes in and hands stream bytes back - so it runs over System.Net.Quic, over io_uring, or over a pair of in-memory queues in a test. Buffered and streamed request bodies, and responses written through an IBufferWriter.</Description>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageProjectUrl>https://github.com/dotnet-web-stack/Glyph3</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/dotnet-web-stack/Glyph3</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageTags>http3;h3;quic;qpack;msquic;sans-io;managed</PackageTags>
+
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <Deterministic>true</Deterministic>
+    </PropertyGroup>
+
+</Project>

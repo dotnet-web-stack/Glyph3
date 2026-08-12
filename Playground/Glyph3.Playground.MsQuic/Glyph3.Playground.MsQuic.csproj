@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>Glyph3.Playground.MsQuic</RootNamespace>
+        <AssemblyName>Glyph3.Playground.MsQuic</AssemblyName>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="../../src/Glyph3/Glyph3.csproj" />
+    </ItemGroup>
+
+</Project>
