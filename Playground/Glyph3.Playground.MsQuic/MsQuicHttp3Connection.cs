@@ -50,9 +50,11 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
 
     private async Task RunAsync(Func<Http3Request, Http3Response> handler, CancellationToken cancellationToken)
     {
-        // Opened before Glyph3 exists, because OpenUniStream answers synchronously. Three is what
-        // HTTP/3 defines; an unwritten stream is never announced, so spares cost nothing.
-        for (int i = 0; i < 3; i++)
+        // Opened before Glyph3 exists, because OpenUniStream answers synchronously. One is enough:
+        // Glyph3 asks for a single unidirectional stream, for control and SETTINGS. The QPACK
+        // encoder and decoder streams HTTP/3 also defines are unused while the dynamic table
+        // capacity is 0.
+        for (int i = 0; i < 1; i++)
         {
             QuicStream uni = await _quic.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, cancellationToken);
             _streams[uni.Id] = uni;
