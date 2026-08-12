@@ -32,7 +32,3 @@ A working HTTP/3 server over `System.Net.Quic` is in
 dotnet run -c Release --project Playground/Glyph3.Playground.MsQuic
 curl --http3 -k https://127.0.0.1:8443/
 ```
-
-## Licence
-
-MIT.
