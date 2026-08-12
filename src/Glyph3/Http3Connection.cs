@@ -74,6 +74,7 @@ public sealed partial class Http3Connection
         // The encoder stream carries instructions that can straddle reads, so a partial one is
         // held here rather than dropped.
         public bool IsEncoder;
+        public bool IsPeerDecoder;
         public byte[]? Carry2;
         public int Carry2Len;
     }
@@ -93,6 +94,12 @@ public sealed partial class Http3Connection
     private long _decoderStreamId = -1;
 
     private int _acknowledgedInserts;
+
+    // The encoding side, created once the peer's SETTINGS say how much table it will hold. Null
+    // means responses are encoded exactly as they were: static references and literals.
+    private QpackEncoder? _encoder;
+
+    private long _encoderStreamId = -1;
 
     private static Http3Options Validate(Http3Options? options)
     {
@@ -554,6 +561,7 @@ public sealed partial class Http3Connection
             us.TypeKnown = true;
             us.IsControl = type == 0x00;
             us.IsEncoder = type == 0x02 && _decodeTable is not null;
+            us.IsPeerDecoder = type == 0x03 && _encoder is not null;
             int fromData = consumed - us.CarryLen;
             us.CarryLen = 0;
             data = data[fromData..];
@@ -585,9 +593,22 @@ public sealed partial class Http3Connection
             return;
         }
 
+        if (us.IsPeerDecoder)
+        {
+            // The peer telling us which of our insertions it holds.
+            QpackDecoderStreamReader.Result ack = _encoder!.ApplyDecoderStream(ref data);
+
+            if (ack == QpackDecoderStreamReader.Result.Error)
+            {
+                Fatal("malformed QPACK decoder instruction");
+            }
+
+            return;
+        }
+
         if (!us.IsControl)
         {
-            return;   // QPACK decoder, push, grease: drain (uni streams are never paced)
+            return;   // push, grease: drain (uni streams are never paced)
         }
 
         while (!data.IsEmpty && !_fatal)
@@ -679,6 +700,7 @@ public sealed partial class Http3Connection
             {
                 case 0x1:   // QPACK_MAX_TABLE_CAPACITY
                     _peerTableCapacity = value;
+                    StartEncoder();
                     break;
 
                 case 0x7:   // QPACK_BLOCKED_STREAMS
@@ -687,6 +709,66 @@ public sealed partial class Http3Connection
             }
         }
     }
+
+    /// <summary>
+    /// Open our encoder stream and start compressing responses, once the peer has said how much
+    /// table it will hold. It cannot happen earlier: that capacity arrives in its SETTINGS.
+    /// </summary>
+    private void StartEncoder()
+    {
+        if (_encoder is not null || _peerTableCapacity <= 0 || _fatal)
+        {
+            return;
+        }
+
+        long stream = _transport.OpenUniStream();
+        if (stream < 0)
+        {
+            return;   // no stream to be had; responses stay literal, which is always valid
+        }
+
+        int capacity = (int)Math.Min(_peerTableCapacity, MaxEncoderTableBytes);
+
+        _encoderStreamId = stream;
+        _encoder = new QpackEncoder(capacity);
+
+        Span<byte> buf = stackalloc byte[16];
+        int w = Varint.Write(buf, 0x02);                                  // stream type: QPACK encoder
+        w += Qpack.WriteInt(buf[w..], 0x20, 5, capacity);                 // Set Dynamic Table Capacity
+        _transport.Send(stream, buf[..w], fin: false);
+    }
+
+    /// <summary>
+    /// Insert what this response repeats, so the next one can reference it. The instructions go out
+    /// before the response itself, which is what gives the peer a chance to acknowledge them.
+    /// </summary>
+    private void OfferToEncoder(Http3Response response)
+    {
+        if (_encoder is null)
+        {
+            return;
+        }
+
+        Span<byte> instruction = stackalloc byte[512];
+
+        foreach ((ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) in response.Headers)
+        {
+            if (name.Length + value.Length + 32 > instruction.Length)
+            {
+                continue;   // too large to be worth a table slot
+            }
+
+            int written = _encoder.TryInsert(instruction, name.Span, value.Span);
+
+            if (written > 0)
+            {
+                _transport.Send(_encoderStreamId, instruction[..written], fin: false);
+            }
+        }
+    }
+
+    /// <summary>A ceiling of our own, whatever the peer offers: its capacity is our memory.</summary>
+    private const int MaxEncoderTableBytes = 4096;
 
     private const int MaxSettingsBytes = 256;
 
@@ -790,7 +872,8 @@ public sealed partial class Http3Connection
             return;
         }
 
-        byte[] fields = Qpack.EncodeResponseFields(resp, out int fieldsLen);
+        OfferToEncoder(resp);
+        byte[] fields = Qpack.EncodeResponseFields(resp, _encoder, out int fieldsLen);
 
         bool hasContentLength = false;
         foreach ((ReadOnlyMemory<byte> name, _) in resp.Headers)

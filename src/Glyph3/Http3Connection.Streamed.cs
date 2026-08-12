@@ -85,7 +85,8 @@ public sealed partial class Http3Connection
     /// <summary>Encode and send the HEADERS frame of a streamed response - no content-length.</summary>
     internal void SendStreamedHeaders(long streamId, Http3Response response)
     {
-        byte[] fields = Qpack.EncodeResponseFields(response, out int fieldsLen);
+        OfferToEncoder(response);
+        byte[] fields = Qpack.EncodeResponseFields(response, _encoder, out int fieldsLen);
         byte[] head = ArrayPool<byte>.Shared.Rent(fieldsLen + 16);
 
         int w = Varint.Write(head.AsSpan(), 0x1);           // HEADERS

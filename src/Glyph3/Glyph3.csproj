@@ -12,9 +12,9 @@
         <LangVersion>13.0</LangVersion>
 
         <PackageId>Glyph3</PackageId>
-        <AssemblyVersion>0.2.0.0</AssemblyVersion>
-        <FileVersion>0.2.0.0</FileVersion>
-        <Version>0.2.0</Version>
+        <AssemblyVersion>0.3.0.0</AssemblyVersion>
+        <FileVersion>0.3.0.0</FileVersion>
+        <Version>0.3.0</Version>
         <Authors>dotnet-web-stack</Authors>
         <Description>A transport-agnostic HTTP/3 connection for .NET: frame parsing, QPACK (static table and Huffman) and request dispatch, in pure managed C# with no native dependencies. Glyph3 does no I/O - it takes stream bytes in and hands stream bytes back - so it runs over System.Net.Quic, over io_uring, or over a pair of in-memory queues in a test. Buffered and streamed request bodies, and responses written through an IBufferWriter.</Description>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>

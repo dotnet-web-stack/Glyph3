@@ -383,8 +383,45 @@ internal static class Qpack
 
     /// <summary>Encode a response's field section (prefix + :status + headers) into a pooled buffer.</summary>
     public static byte[] EncodeResponseFields(Http3Response response, out int written)
+        => EncodeResponseFields(response, null, out written);
+
+    /// <summary>
+    /// Encode a response's field section, referencing <paramref name="encoder"/>'s dynamic table
+    /// where it can.
+    /// </summary>
+    /// <remarks>
+    /// Two passes, because the prefix states the Required Insert Count and every dynamic index is
+    /// measured from Base - neither of which is known until the references are settled.
+    ///
+    /// <para>Only entries the peer has acknowledged are eligible, so a section never depends on an
+    /// insertion still in flight and can never block the peer.</para>
+    /// </remarks>
+    internal static byte[] EncodeResponseFields(Http3Response response, QpackEncoder? encoder, out int written)
     {
-        int cap = 2 + 8;
+        int count = response.Headers.Count;
+
+        // Pass one: an absolute index per header, or -1 to send it literally.
+        int[] references = count > 0 ? ArrayPool<int>.Shared.Rent(count) : [];
+        int highest = -1;
+
+        for (int i = 0; i < count; i++)
+        {
+            (ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) = response.Headers[i];
+
+            int index = encoder?.FindReferenceable(name.Span, value.Span) ?? -1;
+            references[i] = index;
+
+            if (index > highest)
+            {
+                highest = index;
+            }
+        }
+
+        // Base sits one past the highest entry referenced, so a reference to that entry is
+        // relative 0 and the rest count backwards from it.
+        long requiredInsertCount = highest + 1;
+
+        int cap = 16;
         foreach ((ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) in response.Headers)
         {
             cap += 8 + name.Length + 8 + value.Length;
@@ -393,9 +430,10 @@ internal static class Qpack
         byte[] buf = ArrayPool<byte>.Shared.Rent(cap);
         int w = 0;
 
-        // Prefix: RIC 0, Delta Base 0 - the no-dynamic-table constant.
-        buf[w++] = 0x00;
-        buf[w++] = 0x00;
+        // Prefix: encoded Required Insert Count, then sign + Delta Base. Base equals the count, so
+        // the delta is 0 and the sign bit stays clear.
+        w += WriteInt(buf.AsSpan(w), 0x00, 8, EncodeInsertCount(requiredInsertCount, encoder));
+        w += WriteInt(buf.AsSpan(w), 0x00, 7, 0);
 
         // :status - indexed when the static table has it, literal with name ref (idx 24) otherwise.
         byte statusIdx = 0;
@@ -421,8 +459,17 @@ internal static class Qpack
             w += dlen;
         }
 
-        foreach ((ReadOnlyMemory<byte> nameM, ReadOnlyMemory<byte> valueM) in response.Headers)
+        for (int i = 0; i < count; i++)
         {
+            (ReadOnlyMemory<byte> nameM, ReadOnlyMemory<byte> valueM) = response.Headers[i];
+
+            if (references[i] >= 0)
+            {
+                // Indexed Field Line, dynamic: 1 T=0 index(6+), counting back from Base.
+                w += WriteInt(buf.AsSpan(w), 0x80, 6, highest - references[i]);
+                continue;
+            }
+
             // Literal With Literal Name: 001 N=0 H=0 namelen(3+), lowercased name, H=0 value(7+).
             ReadOnlySpan<byte> name = nameM.Span;
             w += WriteInt(buf.AsSpan(w), 0x20, 3, name.Length);
@@ -435,7 +482,28 @@ internal static class Qpack
             w += valueM.Length;
         }
 
+        if (count > 0)
+        {
+            ArrayPool<int>.Shared.Return(references);
+        }
+
         written = w;
         return buf;
+    }
+
+    /// <summary>
+    /// The Required Insert Count as it goes on the wire: wrapped modulo twice the entry capacity so
+    /// it stays small (RFC 9204 4.5.1.1).
+    /// </summary>
+    private static long EncodeInsertCount(long requiredInsertCount, QpackEncoder? encoder)
+    {
+        if (requiredInsertCount == 0 || encoder is null)
+        {
+            return 0;
+        }
+
+        long maxEntries = encoder.Capacity / 32;
+
+        return maxEntries <= 0 ? 0 : requiredInsertCount % (2 * maxEntries) + 1;
     }
 }
