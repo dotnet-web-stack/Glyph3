@@ -166,7 +166,7 @@ internal static class Qpack
 
     // A QPACK string: H bit ahead of an N-bit-prefix length, then bytes (Huffman-coded when H).
     // Output is a pooled buffer + length; the caller returns it.
-    private static bool TryDecodeString(ref ReadOnlySpan<byte> input, int prefixBits, out byte[] buffer, out int length)
+    internal static bool TryDecodeString(ref ReadOnlySpan<byte> input, int prefixBits, out byte[] buffer, out int length)
     {
         buffer = [];
         length = 0;
