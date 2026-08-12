@@ -104,3 +104,68 @@ public class PeerSettingsTests
         public void Send(long streamId, ReadOnlySpan<byte> data, bool fin) { }
     }
 }
+
+/// <summary>
+/// The capacity is a dial, and 0 has to switch the whole mechanism off rather than merely
+/// discourage it.
+/// </summary>
+public class Http3OptionsTests
+{
+    [Fact]
+    public void DefaultsToTheDynamicTableOff()
+    {
+        var options = new Http3Options();
+
+        Assert.Equal(0, options.QpackDynamicTableCapacity);
+        Assert.Equal(0, options.QpackBlockedStreams);
+        Assert.False(options.DynamicTableEnabled);
+    }
+
+    [Fact]
+    public void ANonZeroCapacityIsRefusedWhileTheDecoderCannotHonourIt()
+    {
+        // Advertising a table this build cannot decode would be worse than not offering one:
+        // conforming peers would send references it refuses.
+        var transport = new NullTransport();
+
+        Assert.Throws<NotSupportedException>(() => new Http3Connection(
+            transport,
+            _ => new Http3Response { Status = 200 },
+            new Http3Options { QpackDynamicTableCapacity = 4096 }));
+    }
+
+    [Fact]
+    public void SettingsCarryTheConfiguredValues()
+    {
+        var transport = new RecordingTransport();
+
+        var connection = new Http3Connection(transport, _ => new Http3Response { Status = 200 });
+        connection.Start();
+
+        // stream type 0x00, SETTINGS, length, then id/value pairs
+        byte[] sent = transport.Sent;
+
+        Assert.Equal(0x00, sent[0]);
+        Assert.Equal(0x04, sent[1]);
+        Assert.Equal(4, sent[2]);
+        Assert.Equal(0x01, sent[3]);   // QPACK_MAX_TABLE_CAPACITY
+        Assert.Equal(0x00, sent[4]);   //   = 0
+        Assert.Equal(0x07, sent[5]);   // QPACK_BLOCKED_STREAMS
+        Assert.Equal(0x00, sent[6]);   //   = 0
+    }
+
+    private sealed class NullTransport : IHttp3Transport
+    {
+        public long OpenUniStream() => 3;
+        public void Send(long streamId, ReadOnlySpan<byte> data, bool fin) { }
+    }
+
+    private sealed class RecordingTransport : IHttp3Transport
+    {
+        internal byte[] Sent = [];
+
+        public long OpenUniStream() => 3;
+
+        public void Send(long streamId, ReadOnlySpan<byte> data, bool fin) => Sent = data.ToArray();
+    }
+}

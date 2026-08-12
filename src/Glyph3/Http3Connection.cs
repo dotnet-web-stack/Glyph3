@@ -78,29 +78,50 @@ public sealed partial class Http3Connection
 
     private long _peerBlockedStreams;
 
+    private static Http3Options Validate(Http3Options? options)
+    {
+        Http3Options settled = options ?? Http3Options.Default;
+
+        // Advertising a capacity the decoder cannot honour would be worse than not offering it:
+        // conforming peers would send dynamic references this build refuses.
+        if (settled.DynamicTableEnabled)
+        {
+            throw new NotSupportedException(
+                "The QPACK dynamic table is not implemented yet; leave QpackDynamicTableCapacity at 0.");
+        }
+
+        return settled;
+    }
+
     internal long PeerQpackCapacity() => _peerTableCapacity;
 
     internal long PeerQpackBlockedStreams() => _peerBlockedStreams;
+
+    private readonly Http3Options _options = Http3Options.Default;
 
     private Func<Http3Request, Http3Response>? _buffered;
     private Func<Http3Request, ValueTask<Http3Response>>? _streamingHandler;
 
     /// <summary>Buffered: the handler runs at end-of-stream with the whole body in
     /// <see cref="Http3Request.Body"/>.</summary>
-    public Http3Connection(IHttp3Transport transport, Func<Http3Request, Http3Response> handler)
+    public Http3Connection(IHttp3Transport transport, Func<Http3Request, Http3Response> handler,
+        Http3Options? options = null)
     {
         _transport = transport;
         _buffered = handler;
         _streaming = false;
+        _options = Validate(options);
     }
 
     /// <summary>Streaming: the handler runs at end-of-headers and pulls the body through
     /// <see cref="Http3Request.BodyReader"/> as it arrives.</summary>
-    public Http3Connection(IHttp3Transport transport, Func<Http3Request, ValueTask<Http3Response>> handler)
+    public Http3Connection(IHttp3Transport transport, Func<Http3Request, ValueTask<Http3Response>> handler,
+        Http3Options? options = null)
     {
         _transport = transport;
         _streamingHandler = handler;
         _streaming = true;
+        _options = Validate(options);
     }
 
     /// <summary>True once the connection has failed and can only be torn down.</summary>
@@ -209,8 +230,8 @@ public sealed partial class Http3Connection
         _requests.Clear();
     }
 
-    // Our control stream: stream type 0x00, then SETTINGS pinning the QPACK dynamic table to 0
-    // (QPACK_MAX_TABLE_CAPACITY = 0, QPACK_BLOCKED_STREAMS = 0) - the contract the decoder relies on.
+    // Our control stream: stream type 0x00, then SETTINGS. With the dynamic table off - the
+    // default - these advertise 0/0, which pins conforming peers to static references and literals.
     private void SendControlStream()
     {
         long ctrl = _transport.OpenUniStream();
@@ -226,9 +247,9 @@ public sealed partial class Http3Connection
         w += Varint.Write(buf[w..], 0x4);    // SETTINGS
         w += Varint.Write(buf[w..], 4);      //   length
         w += Varint.Write(buf[w..], 0x1);    //   QPACK_MAX_TABLE_CAPACITY
-        w += Varint.Write(buf[w..], 0);      //     = 0
+        w += Varint.Write(buf[w..], _options.QpackDynamicTableCapacity);
         w += Varint.Write(buf[w..], 0x7);    //   QPACK_BLOCKED_STREAMS
-        w += Varint.Write(buf[w..], 0);      //     = 0
+        w += Varint.Write(buf[w..], _options.QpackBlockedStreams);
         _transport.Send(ctrl, buf[..w], fin: false);
     }
 
