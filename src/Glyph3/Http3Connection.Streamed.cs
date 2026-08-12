@@ -3,12 +3,8 @@ using System.Buffers;
 namespace Glyph3;
 
 /// <summary>
-/// The STREAMED-RESPONSE half of the pure-C# HTTP/3 server: headers go out first and the body
-/// follows as DATA frames, pushed by the handler through an <see cref="Http3ResponseWriter"/>.
-///
-/// Owning the framing is what makes this simple. There is no data-reader callback to answer, so
-/// nothing has to be deferred out of a library call, no buffer lifetime is dictated from outside,
-/// and a chunk is sent the moment it exists rather than when something asks for it.
+/// The streamed-response half: headers go out first, then the body as DATA frames pushed through
+/// an <see cref="Http3ResponseWriter"/>.
 /// </summary>
 public sealed partial class Http3Connection
 {
@@ -19,39 +15,32 @@ public sealed partial class Http3Connection
     internal bool IsBroken => _fatal;
 
     /// <summary>
-    /// Streamed-response flavour: each body is produced through an <see cref="Http3ResponseWriter"/>
-    /// rather than returned whole. The handler owns its stream until it completes the writer.
+    /// Streamed responses: the handler writes its body through an
+    /// <see cref="Http3ResponseWriter"/> and owns the stream until it completes it.
     /// </summary>
     public Http3Connection(IHttp3Transport transport, Func<Http3Request, Http3ResponseWriter, ValueTask> handler)
     {
         _transport = transport;
 
-        // Its own dispatch, rather than tunnelling through the buffered one: a streamed response
-        // has no Http3Response to return, and pretending otherwise meant handing back a sentinel
-        // that Submit then had to recognise and skip.
+        // Its own dispatch: a streamed response has no Http3Response to return.
         _streamedResponseHandler = handler;
         _buffered = NoBufferedHandler;
         _streaming = false;
     }
 
     /// <summary>
-    /// Tell Glyph3 the transport can accept writes again, after
-    /// <see cref="IHttp3Transport.CanSend"/> went false. Hosts whose <c>CanSend</c> is always true
-    /// never need to call it.
+    /// The transport can accept writes again. Only needed where
+    /// <see cref="IHttp3Transport.CanSend"/> can be false.
     /// </summary>
     public void OnSendCapacityAvailable() => ReleaseCapacityWaiters();
 
     private Func<Http3Request, Http3ResponseWriter, ValueTask>? _streamedResponseHandler;
 
-    // Never invoked: DispatchReady hands streamed requests to the writer path before it would be
-    // reached. It exists only because the buffered dispatch demands a handler.
+    // Never invoked: DispatchReady routes streamed requests to the writer path first.
     private static Http3Response NoBufferedHandler(Http3Request _)
         => throw new InvalidOperationException("A streamed connection dispatches through its writer.");
 
-    /// <summary>
-    /// The streamed dispatch, called from the pass that made the request ready - so the writer's
-    /// sends happen inside that pass, like a buffered Submit does.
-    /// </summary>
+    /// <summary>Dispatch from the pass that made the request ready, so sends happen inside it.</summary>
     private bool TryDispatchStreamedResponse(Http3Request request)
     {
         if (_streamedResponseHandler is null)

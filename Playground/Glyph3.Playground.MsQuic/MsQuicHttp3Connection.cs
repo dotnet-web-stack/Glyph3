@@ -7,28 +7,15 @@ using Glyph3;
 namespace Glyph3.Playground.MsQuic;
 
 /// <summary>
-/// One HTTP/3 connection: MsQuic underneath, Glyph3 on top.
-///
-/// Glyph3 owns no I/O, so this is the whole bridge - roughly a hundred lines that read QUIC
-/// streams into <see cref="Http3Connection.Feed"/> and write what comes back out. Everything
-/// HTTP/3 (framing, QPACK, dispatch) is Glyph3's, and everything QUIC (handshake, TLS, loss
-/// recovery, flow control) is MsQuic's.
+/// One HTTP/3 connection: MsQuic underneath, Glyph3 on top. Reads QUIC streams into
+/// <see cref="Http3Connection.Feed"/> and writes back what comes out.
 /// </summary>
 /// <remarks>
-/// Three impedance mismatches are worth pointing at, because any transport bridge hits them:
-///
-/// <para><b>Glyph3 is single-threaded, MsQuic is not.</b> A connection is one state machine -
-/// QPACK's table and the frame parsers span streams - so it cannot be fed from several stream
-/// loops at once. Everything funnels through one channel and one consumer, which is where
-/// serialisation happens.</para>
-///
-/// <para><b>Send is synchronous, WriteAsync is not.</b> Glyph3 hands over a borrowed span and
-/// expects it gone by the time the call returns, so each write is copied into a pooled buffer and
-/// queued. A single writer per connection drains it, which also keeps per-stream ordering.</para>
-///
-/// <para><b>OpenUniStream is synchronous, OpenOutboundStreamAsync is not.</b> HTTP/3 needs
-/// unidirectional streams for control and QPACK, and Glyph3 asks for them mid-parse. So a few are
-/// opened up front, before the connection starts, and handed out from there.</para>
+/// Three mismatches any transport bridge hits, and how they are handled here:
+/// Glyph3 is single-threaded while MsQuic reads streams concurrently, so everything funnels
+/// through one channel and one consumer. <c>Send</c> is synchronous and borrows its span, so each
+/// write is copied and queued for a single writer task. <c>OpenUniStream</c> is synchronous, so
+/// the unidirectional streams are opened before the connection starts.
 /// </remarks>
 internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
 {
@@ -63,9 +50,8 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
 
     private async Task RunAsync(Func<Http3Request, Http3Response> handler, CancellationToken cancellationToken)
     {
-        // Opened BEFORE Glyph3 exists, because OpenUniStream has to answer synchronously. Three is
-        // what HTTP/3 defines (control, QPACK encoder, QPACK decoder); Glyph3 currently asks for
-        // one, and the spares cost nothing since an unwritten stream is never announced to the peer.
+        // Opened before Glyph3 exists, because OpenUniStream answers synchronously. Three is what
+        // HTTP/3 defines; an unwritten stream is never announced, so spares cost nothing.
         for (int i = 0; i < 3; i++)
         {
             QuicStream uni = await _quic.OpenOutboundStreamAsync(QuicStreamType.Unidirectional, cancellationToken);
@@ -91,7 +77,7 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
         }
     }
 
-    // The one place Glyph3 is called. Single consumer, so no locking anywhere in the library.
+    // The one place Glyph3 is called, so it never needs a lock.
     private async Task PumpAsync(CancellationToken cancellationToken)
     {
         _h3!.Start();
@@ -108,7 +94,7 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
                 {
                     _h3.Feed(item.StreamId, item.Buffer.AsSpan(0, item.Length), item.Fin);
 
-                    // The end-of-stream marker carries no buffer: it exists to deliver fin.
+                    // The end-of-stream marker carries no buffer, only fin.
                     if (item.Buffer is not null)
                     {
                         ArrayPool<byte>.Shared.Return(item.Buffer);
@@ -116,7 +102,7 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
                 }
             }
 
-            // Once per batch rather than per chunk - the whole reason Feed and Flush are separate.
+            // Once per batch, which is why Feed and Flush are separate.
             _h3.Flush();
 
             if (_h3.IsFaulted)
@@ -139,7 +125,7 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
         }
         catch (Exception)
         {
-            // The connection closed, which is how an accept loop always ends.
+            // The connection closed, which is how an accept loop ends.
         }
     }
 
@@ -196,7 +182,7 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
         }
         catch (Exception)
         {
-            // Peer went away mid-write; the connection is finished either way.
+            // Peer went away mid-write.
         }
     }
 
@@ -207,15 +193,13 @@ internal sealed class MsQuicHttp3Connection : IHttp3Transport, IAsyncDisposable
 
     public void Send(long streamId, ReadOnlySpan<byte> data, bool fin)
     {
-        // Copied because the span is borrowed: Glyph3 may reuse it the moment this returns, and
-        // the actual write happens later on the writer task.
+        // Copied because the span is borrowed and the write happens later.
         byte[] buffer = ArrayPool<byte>.Shared.Rent(Math.Max(1, data.Length));
         data.CopyTo(buffer);
         _egress.Writer.TryWrite(new Outbound(streamId, buffer, data.Length, fin));
     }
 
-    // MsQuic manages flow-control windows itself, and applies backpressure through WriteAsync, so
-    // ReleaseFlowControl, CanSend and SetStreamPaced all keep their defaults.
+    // MsQuic handles flow control and backpressure itself, so the other three keep their defaults.
 
     public async ValueTask DisposeAsync()
     {

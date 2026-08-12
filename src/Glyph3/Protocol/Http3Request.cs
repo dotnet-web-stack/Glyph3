@@ -24,7 +24,7 @@ public sealed class Http3Request
     /// dispatch happens at end-of-headers and the body arrives while the handler runs.</summary>
     public Http3BodyReader? BodyReader { get; internal set; }
 
-    // --- assembly (reactor thread; same arena/ranges design as the nghttp3 layer: only offsets
+    // --- assembly (only offsets
     //     are recorded while the arena can still grow, memories materialize at Freeze) ---
 
     internal byte[] Arena = [];
@@ -94,7 +94,7 @@ public sealed class Http3Request
 
 /// <summary>
 /// One HTTP/3 response: status, headers, in-memory body - bytes throughout. Everything is encoded
-/// and handed to the QUIC engine synchronously at submit, so the memories can be pooled or static.
+/// and handed to the transport synchronously at submit, so the memories can be pooled or static.
 /// </summary>
 public sealed class Http3Response
 {

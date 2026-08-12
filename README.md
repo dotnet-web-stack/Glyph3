@@ -3,7 +3,7 @@
 [![Glyph3](https://img.shields.io/nuget/v/Glyph3.svg?label=Glyph3)](https://www.nuget.org/packages/Glyph3/)
 ![.NET](https://img.shields.io/badge/.NET-8.0%20%7C%209.0%20%7C%2010.0-512bd4)
 
-HTTP/3 without the QUIC — frame parsing, QPACK and request dispatch in pure managed C#, with no
+HTTP/3 without the QUIC: frame parsing, QPACK and request dispatch in pure managed C#, with no
 native dependencies. Glyph3 does no I/O of its own: you hand it the bytes that arrived on a stream
 and it hands back the bytes to send, so the transport underneath can be `System.Net.Quic`, io_uring,
 or a pair of in-memory queues in a test.

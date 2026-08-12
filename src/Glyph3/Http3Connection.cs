@@ -1,20 +1,15 @@
 using System.Buffers;
 
-
 namespace Glyph3;
 
 /// <summary>
-/// HTTP/3 over any QUIC transport, implemented entirely in C# - frame parsing,
-/// QPACK (static table + Huffman) and request dispatch, no native dependencies. The public
-/// surface comes in two flavours: buffered (dispatch at end-of-stream,
-/// body pre-assembled) and a streaming overload (dispatch at end-of-headers, body pulled through
-/// <see cref="Http3Request.BodyReader"/> while the request stream is flow-control paced).
-///
-/// Our SETTINGS advertise QPACK dynamic-table capacity 0, which pins conforming peers to
-/// static-table references and literals - the entire decoder surface this library implements.
-/// Calls must be serialised by the host; wakes for parked body reads are deferred to the end of
-/// each Flush (fire-after-unwind: a wake never runs inside a parse).
+/// HTTP/3 over any QUIC transport: frame parsing, QPACK and request dispatch.
 /// </summary>
+/// <remarks>
+/// SETTINGS advertise QPACK dynamic-table capacity 0, so conforming peers use static-table
+/// references and literals only, which is what the decoder implements. Calls must be serialised by
+/// the host; body-read wakes fire at the end of <see cref="Flush"/>, never inside a parse.
+/// </remarks>
 public sealed partial class Http3Connection
 {
     private readonly IHttp3Transport _transport;
@@ -74,10 +69,8 @@ public sealed partial class Http3Connection
     private Func<Http3Request, Http3Response>? _buffered;
     private Func<Http3Request, ValueTask<Http3Response>>? _streamingHandler;
 
-    /// <summary>
-    /// Buffered flavour: the handler is called at end-of-stream with the whole body already in
-    /// <see cref="Http3Request.Body"/>.
-    /// </summary>
+    /// <summary>Buffered: the handler runs at end-of-stream with the whole body in
+    /// <see cref="Http3Request.Body"/>.</summary>
     public Http3Connection(IHttp3Transport transport, Func<Http3Request, Http3Response> handler)
     {
         _transport = transport;
@@ -85,10 +78,8 @@ public sealed partial class Http3Connection
         _streaming = false;
     }
 
-    /// <summary>
-    /// Streaming flavour: the handler is called at END-OF-HEADERS and pulls the body through
-    /// <see cref="Http3Request.BodyReader"/> while it arrives.
-    /// </summary>
+    /// <summary>Streaming: the handler runs at end-of-headers and pulls the body through
+    /// <see cref="Http3Request.BodyReader"/> as it arrives.</summary>
     public Http3Connection(IHttp3Transport transport, Func<Http3Request, ValueTask<Http3Response>> handler)
     {
         _transport = transport;
@@ -100,9 +91,8 @@ public sealed partial class Http3Connection
     public bool IsFaulted => _fatal;
 
     /// <summary>
-    /// Open the control stream and send SETTINGS. Optional: <see cref="Flush"/> does it on the
-    /// first pass anyway, because a transport may not be able to open a unidirectional stream
-    /// before its handshake completes.
+    /// Open the control stream and send SETTINGS. Optional, since <see cref="Flush"/> retries it
+    /// until it succeeds.
     /// </summary>
     public void Start()
     {
@@ -113,14 +103,9 @@ public sealed partial class Http3Connection
     }
 
     /// <summary>
-    /// Hand Glyph3 bytes that arrived on a stream. Parses only - nothing is dispatched until
-    /// <see cref="Flush"/>, so a host that receives in batches can feed the whole batch and
-    /// dispatch once.
+    /// Feed bytes that arrived on a stream. Parses only; call <see cref="Flush"/> to dispatch.
+    /// <paramref name="data"/> is borrowed for the call and may be reused on return.
     /// </summary>
-    /// <remarks>
-    /// <paramref name="data"/> is borrowed for the duration of the call; Glyph3 copies whatever it
-    /// needs to keep. The caller may reuse or release the memory as soon as this returns.
-    /// </remarks>
     public void Feed(long streamId, ReadOnlySpan<byte> data, bool fin)
     {
         if (_fatal)
@@ -145,7 +130,7 @@ public sealed partial class Http3Connection
         {
             if (fin && data.Length == 0)
             {
-                return;   // empty stream - there is nothing to answer
+                return;   // empty stream, nothing to answer
             }
             rs = new ReqStream();
             rs.Request.StreamId = streamId;
@@ -155,10 +140,7 @@ public sealed partial class Http3Connection
         FeedRequest(streamId, rs, data, fin);
     }
 
-    /// <summary>
-    /// A stream ended without delivering data - reset, stop-sending, or the connection dropping it.
-    /// Any half-parsed request on it is abandoned.
-    /// </summary>
+    /// <summary>A stream ended without data. Any half-parsed request on it is abandoned.</summary>
     public void OnStreamClosed(long streamId)
     {
         if (_requests.Remove(streamId, out ReqStream? dead))
@@ -169,10 +151,8 @@ public sealed partial class Http3Connection
         _unis.Remove(streamId);
     }
 
-    /// <summary>
-    /// Wake parked body reads and dispatch whatever became complete. Call once after a batch of
-    /// <see cref="Feed"/> calls; calling it per chunk is correct too, just more often.
-    /// </summary>
+    /// <summary>Wake parked body reads and dispatch what became complete. Call after a batch of
+    /// <see cref="Feed"/> calls, or after each one.</summary>
     public void Flush()
     {
         if (_fatal)
@@ -180,8 +160,7 @@ public sealed partial class Http3Connection
             return;
         }
 
-        // A transport may refuse to open a unidirectional stream before its handshake finishes, so
-        // this is retried until it takes rather than being a one-shot at construction.
+        // Retried: a transport may not open uni streams before its handshake finishes.
         if (!_controlSent)
         {
             SendControlStream();
@@ -200,8 +179,8 @@ public sealed partial class Http3Connection
     }
 
     /// <summary>
-    /// Tear the connection down: abandon half-parsed requests and release parked body readers, so
-    /// a handler awaiting a body that will never arrive is not left hanging.
+    /// Tear down: abandon half-parsed requests and release parked body readers, so a handler
+    /// awaiting a body that will never arrive is not left hanging.
     /// </summary>
     public void Close()
     {
@@ -600,7 +579,7 @@ public sealed partial class Http3Connection
     // --- egress --------------------------------------------------------------------------------
 
     // Encode and send one response: HEADERS frame (+ DATA frame header) in one SendStream call,
-    // the body (with fin) in a second - the engine copies into its retention chunks either way.
+    // the body (with fin) in a second.
     private void Submit(long streamId, Http3Response resp)
     {
         if (resp.HeadIsValid)

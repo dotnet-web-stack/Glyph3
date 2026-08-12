@@ -3,23 +3,14 @@ using System.Buffers;
 namespace Glyph3;
 
 /// <summary>
-/// The write half of a STREAMED response: the handler pushes body bytes as it produces them, and
-/// each flush becomes a DATA frame on the wire.
-///
-/// This is a push, not a pull. Owning the framing means a chunk can simply be sent - build
-/// <c>[0x00][varint length][payload]</c> and hand it to the QUIC stream - with no data-reader
-/// callback to answer, nothing to defer, and no buffer whose lifetime a library dictates. QUIC
-/// streams are independent, so nothing has to be interleaved with other responses either.
-///
-/// It is an <see cref="IBufferWriter{T}"/> on purpose: that is the shape a serializer, a file
-/// copy or a framework's response sink already writes into, so streaming through it needs no
-/// adapter.
-///
-/// Backpressure is the connection's send retention. <see cref="FlushAsync"/> returns once the
-/// chunk is queued, and waits when the connection is at its high-water, so a producer cannot
-/// outrun a peer that has stopped reading.
+/// The write half of a streamed response: the handler pushes body bytes and each flush becomes a
+/// DATA frame.
 /// </summary>
-/// <remarks>Single-threaded, like everything else on the connection.</remarks>
+/// <remarks>
+/// An <see cref="IBufferWriter{T}"/> because that is what serializers and response sinks already
+/// write into. <see cref="FlushAsync"/> waits when the transport reports no send capacity, so a
+/// producer cannot outrun a stalled peer. Single-threaded, like the rest of the connection.
+/// </remarks>
 public sealed class Http3ResponseWriter : IBufferWriter<byte>
 {
     private const int DefaultChunk = 16 * 1024;
@@ -49,11 +40,8 @@ public sealed class Http3ResponseWriter : IBufferWriter<byte>
     public bool IsCompleted => _completed;
 
     /// <summary>
-    /// Send the response headers. Exactly once, before any body byte - HTTP/3 puts HEADERS ahead
-    /// of DATA and there is no correcting that later.
-    ///
-    /// No content-length is written: a streamed response does not know its length yet, and for an
-    /// endless one there is no length to know. HTTP/3 needs none - each DATA frame carries its own.
+    /// Send the response headers. Once, before any body byte. No content-length: a streamed
+    /// response has none, and each DATA frame carries its own length.
     /// </summary>
     public void WriteHeaders(Http3Response response)
     {
@@ -100,15 +88,13 @@ public sealed class Http3ResponseWriter : IBufferWriter<byte>
     }
 
     /// <summary>
-    /// Send everything staged so far as one DATA frame. Waits first when the connection is at its
-    /// send-retention high-water: that wait is the backpressure, and it is what keeps memory bound
-    /// to one chunk rather than to the whole response.
+    /// Send what is staged as one DATA frame, waiting first if the transport has no send capacity.
+    /// That wait is the backpressure, and bounds memory to one chunk.
     /// </summary>
     public ValueTask FlushAsync() => FlushCore(fin: false);
 
     /// <summary>
-    /// Send what is left and close the stream. A handler that returns without calling this still
-    /// gets it called for it - the peer is owed an end either way.
+    /// Send what is left and close the stream. Called for a handler that returns without it.
     /// </summary>
     public async ValueTask CompleteAsync()
     {
@@ -144,8 +130,7 @@ public sealed class Http3ResponseWriter : IBufferWriter<byte>
             return;
         }
 
-        // The peer has stopped reading and the connection is holding all it is willing to. Wait
-        // rather than queue: unbounded queueing here is exactly what streaming exists to avoid.
+        // Wait rather than queue: unbounded queueing is what streaming exists to avoid.
         while (!_transport.CanSend && !_connection.IsBroken)
         {
             await _connection.WaitForSendCapacityAsync();
@@ -162,8 +147,8 @@ public sealed class Http3ResponseWriter : IBufferWriter<byte>
             return;
         }
 
-        // [0x00][varint length][payload], sent as one call - the header is tiny and splitting it
-        // from its payload would cost a second trip through the QUIC send path per chunk.
+        // [0x00][varint length][payload] in one call, to avoid a second trip through the
+        // transport per chunk.
         Span<byte> header = stackalloc byte[16];
         int h = Varint.Write(header, FrameData);
         h += Varint.Write(header[h..], _staged);
@@ -198,11 +183,7 @@ public sealed class Http3ResponseWriter : IBufferWriter<byte>
         _staging = grown;
     }
 
-    /// <summary>
-    /// Take this writer for another stream, keeping its buffer. A writer and its staging block
-    /// carry nothing stream-specific once reset, and allocating both per response is what made the
-    /// nghttp3 streamed path heavier than its buffered one.
-    /// </summary>
+    /// <summary>Reuse this writer for another stream, keeping its staging buffer.</summary>
     internal void Reset(long streamId)
     {
         _streamId = streamId;

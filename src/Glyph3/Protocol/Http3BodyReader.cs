@@ -4,19 +4,14 @@ using System.Threading.Tasks.Sources;
 namespace Glyph3;
 
 /// <summary>
-/// Pull surface for a streaming request body (the async <see cref="Http3Connection.RunAsync(Func{Http3Request, ValueTask{Http3Response}})"/>
-/// overload): the connection loop pushes body chunks in as nghttp3 delivers them, the handler
-/// pulls with <see cref="ReadAsync"/>. An empty chunk means end of body (fin or stream reset).
-///
-/// Backpressure is real, not buffered-and-prayed: the request stream is flow-control paced, and
-/// each chunk is credited back to the peer's window only as it is handed to the handler - a slow
-/// consumer freezes the window and the PEER stops sending, so the sink never holds more than a
-/// window's worth (256 KB by engine default).
-///
-/// Contract: single consumer, reactor thread only, and each ReadAsync invalidates the previous
-/// chunk's memory (its pooled buffer is recycled). Wakes are deferred by the connection loop to
-/// after nghttp3 unwinds - same discipline as the engine's once-per-read fire.
+/// Pull surface for a streaming request body. The connection pushes chunks in, the handler pulls
+/// with <see cref="ReadAsync"/>, and an empty chunk means end of body.
 /// </summary>
+/// <remarks>
+/// Each chunk is credited back to the peer's flow-control window only as it reaches the handler,
+/// so a slow consumer stalls the peer instead of buffering. Single consumer; each
+/// <see cref="ReadAsync"/> invalidates the previous chunk's memory.
+/// </remarks>
 public sealed class Http3BodyReader : IValueTaskSource<ReadOnlyMemory<byte>>
 {
     private readonly Http3Connection _owner;
@@ -64,9 +59,8 @@ public sealed class Http3BodyReader : IValueTaskSource<ReadOnlyMemory<byte>>
         return new ValueTask<ReadOnlyMemory<byte>>(this, _core.Version);
     }
 
-    // Body bytes from nghttp3 (reactor thread, inside ih3_read_stream - the span dies at return,
-    // so copy into a pooled buffer). Never completes the reader inline: the wake is deferred to
-    // FireIfReady after nghttp3 unwinds, so a resumed handler can't re-enter it mid-read.
+    // The span dies at return, so copy into a pooled buffer. Never completes the reader inline:
+    // the wake is deferred to FireIfReady so a resumed handler cannot re-enter mid-parse.
     internal void Push(ReadOnlySpan<byte> data)
     {
         if (data.IsEmpty)
@@ -96,7 +90,7 @@ public sealed class Http3BodyReader : IValueTaskSource<ReadOnlyMemory<byte>>
         }
     }
 
-    // The deferred wake: complete a parked ReadAsync now that the engine layers have unwound.
+    // The deferred wake: complete a parked ReadAsync now the parse has unwound.
     internal void FireIfReady()
     {
         if (!_armed)
@@ -137,8 +131,7 @@ public sealed class Http3BodyReader : IValueTaskSource<ReadOnlyMemory<byte>>
         }
     }
 
-    // IValueTaskSource<ReadOnlyMemory<byte>> - completes on the reactor thread only; strip the
-    // context-post so resumes stay inline where the host has a single-threaded context.
+    // Strip the context-post so resumes stay inline on a single-threaded host.
     ReadOnlyMemory<byte> IValueTaskSource<ReadOnlyMemory<byte>>.GetResult(short token) => _core.GetResult(token);
 
     ValueTaskSourceStatus IValueTaskSource<ReadOnlyMemory<byte>>.GetStatus(short token) => _core.GetStatus(token);

@@ -2,7 +2,7 @@ namespace Glyph3;
 
 /// <summary>
 /// HPACK/QPACK Huffman decoding (RFC 7541 Appendix B - QPACK reuses the table verbatim). The
-/// symbol table below is extracted from nghttp3's generated huffman_sym_table (codes left-aligned
+/// symbol table below is the RFC 7541 Appendix B code (codes left-aligned
 /// in 32 bits), so it is byte-identical to what the reference implementation encodes with. Decode
 /// walks a binary tree built once at startup - not the fastest possible scheme, but branch-simple
 /// and obviously correct; swap in a table-driven FSM if it ever shows in a profile.
