@@ -386,6 +386,82 @@ internal static class Qpack
         => EncodeResponseFields(response, null, out written);
 
     /// <summary>
+    /// The static-only path: one pass, no reference array, and a constant prefix.
+    /// </summary>
+    /// <remarks>
+    /// Taken whenever there is no encoder, which is the case for any peer advertising a QPACK
+    /// capacity of 0. Required Insert Count and Delta Base are both 0 because nothing dynamic is
+    /// referenced, so the prefix is two zero bytes rather than something to compute.
+    /// </remarks>
+    private static byte[] EncodeStaticOnlyResponseFields(Http3Response response, out int written)
+    {
+        byte[] buf = ArrayPool<byte>.Shared.Rent(ResponseBufferSize(response));
+
+        buf[0] = 0;
+        buf[1] = 0;
+        int w = 2;
+
+        w += WriteStatus(buf.AsSpan(w), response.Status);
+
+        foreach ((ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) in response.Headers)
+        {
+            w += WriteLiteralHeader(buf.AsSpan(w), name.Span, value.Span);
+        }
+
+        written = w;
+        return buf;
+    }
+
+    /// <summary>Worst case bytes for a response's field section: every header sent literally.</summary>
+    private static int ResponseBufferSize(Http3Response response)
+    {
+        int cap = 16;
+
+        foreach ((ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) in response.Headers)
+        {
+            cap += 8 + name.Length + 8 + value.Length;
+        }
+
+        return cap;
+    }
+
+    /// <summary>:status - indexed when the static table has that code, literal by name otherwise.</summary>
+    private static int WriteStatus(Span<byte> buf, int status)
+    {
+        foreach ((int candidate, byte idx) in IndexedStatuses)
+        {
+            if (candidate == status)
+            {
+                return WriteInt(buf, 0xC0, 6, idx);                  // 1 T=1 index
+            }
+        }
+
+        int w = WriteInt(buf, 0x50, 4, 24);                          // 01 N=0 T=1 nameidx
+        Span<byte> digits = stackalloc byte[3];
+        System.Buffers.Text.Utf8Formatter.TryFormat(status, digits, out int dlen);
+        w += WriteInt(buf[w..], 0x00, 7, dlen);                      // H=0 value
+        digits[..dlen].CopyTo(buf[w..]);
+
+        return w + dlen;
+    }
+
+    /// <summary>Literal With Literal Name: 001 N=0 H=0 namelen(3+), lowercased name, H=0 value(7+).</summary>
+    private static int WriteLiteralHeader(Span<byte> buf, ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+    {
+        int w = WriteInt(buf, 0x20, 3, name.Length);
+
+        foreach (byte b in name)
+        {
+            buf[w++] = b is >= (byte)'A' and <= (byte)'Z' ? (byte)(b | 0x20) : b;
+        }
+
+        w += WriteInt(buf[w..], 0x00, 7, value.Length);
+        value.CopyTo(buf[w..]);
+
+        return w + value.Length;
+    }
+
+    /// <summary>
     /// Encode a response's field section, referencing <paramref name="encoder"/>'s dynamic table
     /// where it can.
     /// </summary>
@@ -398,6 +474,14 @@ internal static class Qpack
     /// </remarks>
     internal static byte[] EncodeResponseFields(Http3Response response, QpackEncoder? encoder, out int written)
     {
+        // No encoder means no dynamic reference can exist, so the reference pass below - and the
+        // array that carries it - compute a row of -1 and nothing else. Worth skipping outright:
+        // every client measured except a browser advertises a capacity of 0, which leaves this null.
+        if (encoder is null)
+        {
+            return EncodeStaticOnlyResponseFields(response, out written);
+        }
+
         int count = response.Headers.Count;
 
         // Pass one: an absolute index per header, or -1 to send it literally.
@@ -421,13 +505,7 @@ internal static class Qpack
         // relative 0 and the rest count backwards from it.
         long requiredInsertCount = highest + 1;
 
-        int cap = 16;
-        foreach ((ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) in response.Headers)
-        {
-            cap += 8 + name.Length + 8 + value.Length;
-        }
-
-        byte[] buf = ArrayPool<byte>.Shared.Rent(cap);
+        byte[] buf = ArrayPool<byte>.Shared.Rent(ResponseBufferSize(response));
         int w = 0;
 
         // Prefix: encoded Required Insert Count, then sign + Delta Base. Base equals the count, so
@@ -435,29 +513,7 @@ internal static class Qpack
         w += WriteInt(buf.AsSpan(w), 0x00, 8, EncodeInsertCount(requiredInsertCount, encoder));
         w += WriteInt(buf.AsSpan(w), 0x00, 7, 0);
 
-        // :status - indexed when the static table has it, literal with name ref (idx 24) otherwise.
-        byte statusIdx = 0;
-        foreach ((int status, byte idx) in IndexedStatuses)
-        {
-            if (status == response.Status)
-            {
-                statusIdx = idx;
-                break;
-            }
-        }
-        if (statusIdx != 0)
-        {
-            w += WriteInt(buf.AsSpan(w), 0xC0, 6, statusIdx);        // 1 T=1 index
-        }
-        else
-        {
-            w += WriteInt(buf.AsSpan(w), 0x50, 4, 24);               // 01 N=0 T=1 nameidx
-            Span<byte> digits = stackalloc byte[3];
-            System.Buffers.Text.Utf8Formatter.TryFormat(response.Status, digits, out int dlen);
-            w += WriteInt(buf.AsSpan(w), 0x00, 7, dlen);             // H=0 value
-            digits[..dlen].CopyTo(buf.AsSpan(w));
-            w += dlen;
-        }
+        w += WriteStatus(buf.AsSpan(w), response.Status);
 
         for (int i = 0; i < count; i++)
         {
@@ -470,16 +526,7 @@ internal static class Qpack
                 continue;
             }
 
-            // Literal With Literal Name: 001 N=0 H=0 namelen(3+), lowercased name, H=0 value(7+).
-            ReadOnlySpan<byte> name = nameM.Span;
-            w += WriteInt(buf.AsSpan(w), 0x20, 3, name.Length);
-            foreach (byte b in name)
-            {
-                buf[w++] = b is >= (byte)'A' and <= (byte)'Z' ? (byte)(b | 0x20) : b;
-            }
-            w += WriteInt(buf.AsSpan(w), 0x00, 7, valueM.Length);
-            valueM.Span.CopyTo(buf.AsSpan(w));
-            w += valueM.Length;
+            w += WriteLiteralHeader(buf.AsSpan(w), nameM.Span, valueM.Span);
         }
 
         if (count > 0)

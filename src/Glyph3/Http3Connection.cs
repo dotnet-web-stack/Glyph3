@@ -6,9 +6,10 @@ namespace Glyph3;
 /// HTTP/3 over any QUIC transport: frame parsing, QPACK and request dispatch.
 /// </summary>
 /// <remarks>
-/// SETTINGS advertise QPACK dynamic-table capacity 0, so conforming peers use static-table
-/// references and literals only, which is what the decoder implements. Calls must be serialised by
-/// the host; body-read wakes fire at the end of <see cref="Flush"/>, never inside a parse.
+/// SETTINGS advertise the QPACK dynamic-table capacity from <see cref="Http3Options"/>, which
+/// defaults to 0: at 0 the table is skipped entirely in both directions, and responses are encoded
+/// with static-table references and literals only. Calls must be serialised by the host; body-read
+/// wakes fire at the end of <see cref="Flush"/>, never inside a parse.
 /// </remarks>
 public sealed partial class Http3Connection
 {
@@ -87,6 +88,8 @@ public sealed partial class Http3Connection
 
     private long _peerBlockedStreams;
 
+    private bool _peerSettingsReceived;
+
     // Built from the peer's encoder stream when a capacity is advertised; null keeps the
     // capacity-0 behaviour, where any dynamic reference is refused.
     private QpackDynamicTable? _decodeTable;
@@ -122,6 +125,17 @@ public sealed partial class Http3Connection
     internal long PeerQpackCapacity() => _peerTableCapacity;
 
     internal long PeerQpackBlockedStreams() => _peerBlockedStreams;
+
+    /// <summary>
+    /// Whether the peer's SETTINGS have arrived yet.
+    /// </summary>
+    /// <remarks>
+    /// Until they have, <see cref="PeerDynamicTableCapacity"/> reads 0 because nothing has been said
+    /// - which is indistinguishable from a peer that genuinely advertised 0. Check this before
+    /// concluding anything from a zero, since SETTINGS arrive on the control stream and a request
+    /// can in principle be dispatched first.
+    /// </remarks>
+    public bool PeerSettingsReceived => _peerSettingsReceived;
 
     /// <summary>
     /// What the peer's SETTINGS advertised as its QPACK dynamic table capacity, in bytes.
@@ -704,6 +718,8 @@ public sealed partial class Http3Connection
     /// </summary>
     private void ApplyPeerSettings(ReadOnlySpan<byte> payload)
     {
+        _peerSettingsReceived = true;
+
         while (!payload.IsEmpty)
         {
             if (!Varint.TryRead(payload, out long id, out int idLen))
