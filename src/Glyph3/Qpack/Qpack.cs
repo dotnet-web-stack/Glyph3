@@ -3,11 +3,11 @@ using System.Buffers;
 namespace Glyph3;
 
 /// <summary>
-/// QPACK (RFC 9204) without the dynamic table: our SETTINGS advertise capacity 0, so a conforming
-/// peer may only send static-table references and literals - which reduces the decoder to the
-/// static table, prefixed integers, and Huffman. The encoder mirrors that: indexed :status where
-/// the table has the code, literal name references otherwise, literal names for everything else,
-/// no Huffman on output (legal, and keeps the writer trivial).
+/// QPACK (RFC 9204). The decoder resolves static references, prefixed integers and Huffman, plus
+/// dynamic references when a table is configured. The encoder prefers the static table for every
+/// field, not just :status: an entry matching both name and value costs one byte, a known name
+/// costs an index plus the literal value, and only an unknown name is spelled out. No Huffman on
+/// output - legal, and it keeps the writer trivial.
 /// </summary>
 internal static class Qpack
 {
@@ -405,7 +405,7 @@ internal static class Qpack
 
         foreach ((ReadOnlyMemory<byte> name, ReadOnlyMemory<byte> value) in response.Headers)
         {
-            w += WriteLiteralHeader(buf.AsSpan(w), name.Span, value.Span);
+            w += WriteHeader(buf.AsSpan(w), name.Span, value.Span);
         }
 
         written = w;
@@ -443,6 +443,141 @@ internal static class Qpack
         digits[..dlen].CopyTo(buf[w..]);
 
         return w + dlen;
+    }
+
+
+    /// <summary>
+    /// The static table indexed for encoding: distinct names, each with the entries that share it.
+    /// </summary>
+    /// <remarks>
+    /// Grouped rather than flat so a lookup compares one candidate per distinct name and rejects
+    /// most on length alone. Built once; the table is 99 fixed entries.
+    /// </remarks>
+    private static readonly (byte[] Name, int NameIndex, (byte[] Value, int Index)[] Values)[] StaticNames = BuildStaticNames();
+
+    private static (byte[] Name, int NameIndex, (byte[] Value, int Index)[] Values)[] BuildStaticNames()
+    {
+        var byName = new List<(byte[] Name, int NameIndex, List<(byte[] Value, int Index)> Values)>();
+
+        for (int i = 0; i < QpackStatic.Table.Length; i++)
+        {
+            (byte[] name, byte[] value) = QpackStatic.Table[i];
+
+            int at = -1;
+            for (int j = 0; j < byName.Count; j++)
+            {
+                if (byName[j].Name.AsSpan().SequenceEqual(name))
+                {
+                    at = j;
+                    break;
+                }
+            }
+
+            if (at < 0)
+            {
+                byName.Add((name, i, [(value, i)]));
+            }
+            else
+            {
+                byName[at].Values.Add((value, i));
+            }
+        }
+
+        var result = new (byte[], int, (byte[], int)[])[byName.Count];
+
+        for (int i = 0; i < byName.Count; i++)
+        {
+            result[i] = (byName[i].Name, byName[i].NameIndex, byName[i].Values.ToArray());
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Finds a header in the static table: an exact name and value match, or failing that a name.
+    /// </summary>
+    /// <remarks>
+    /// Names are matched case-insensitively, so a caller holding HTTP's conventional capitalisation
+    /// still resolves - and then never writes the name at all, which is the point. Values are
+    /// matched exactly, because a field value is case-sensitive.
+    /// </remarks>
+    private static bool TryFindStatic(ReadOnlySpan<byte> name, ReadOnlySpan<byte> value, out int exact, out int nameIndex)
+    {
+        exact = -1;
+        nameIndex = -1;
+
+        foreach ((byte[] candidate, int candidateIndex, (byte[] Value, int Index)[] values) in StaticNames)
+        {
+            if (candidate.Length != name.Length || !EqualsIgnoreCase(candidate, name))
+            {
+                continue;
+            }
+
+            nameIndex = candidateIndex;
+
+            foreach ((byte[] entryValue, int entryIndex) in values)
+            {
+                if (entryValue.AsSpan().SequenceEqual(value))
+                {
+                    exact = entryIndex;
+                    break;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool EqualsIgnoreCase(ReadOnlySpan<byte> lowercase, ReadOnlySpan<byte> other)
+    {
+        for (int i = 0; i < lowercase.Length; i++)
+        {
+            byte c = other[i];
+
+            if (c is >= (byte)'A' and <= (byte)'Z')
+            {
+                c |= 0x20;
+            }
+
+            if (c != lowercase[i])
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Writes one header, preferring the static table over spelling the name out.
+    /// </summary>
+    /// <remarks>
+    /// Three tiers, cheapest first: both name and value in the table costs a single byte; a known
+    /// name costs an index plus the literal value; anything else falls back to the full literal.
+    /// This works against every client, unlike the dynamic table, which stays unused unless the
+    /// peer advertised capacity for one.
+    /// </remarks>
+    private static int WriteHeader(Span<byte> buf, ReadOnlySpan<byte> name, ReadOnlySpan<byte> value)
+    {
+        if (TryFindStatic(name, value, out int exact, out int nameIndex))
+        {
+            if (exact >= 0)
+            {
+                // Indexed Field Line: 1 T=1 index(6+).
+                return WriteInt(buf, 0xC0, 6, exact);
+            }
+
+            // Literal With Name Reference: 01 N=0 T=1 nameindex(4+), then H=0 value(7+).
+            int written = WriteInt(buf, 0x50, 4, nameIndex);
+            written += WriteInt(buf[written..], 0x00, 7, value.Length);
+            value.CopyTo(buf[written..]);
+
+            return written + value.Length;
+        }
+
+        return WriteLiteralHeader(buf, name, value);
     }
 
     /// <summary>Literal With Literal Name: 001 N=0 H=0 namelen(3+), lowercased name, H=0 value(7+).</summary>
@@ -526,7 +661,7 @@ internal static class Qpack
                 continue;
             }
 
-            w += WriteLiteralHeader(buf.AsSpan(w), nameM.Span, valueM.Span);
+            w += WriteHeader(buf.AsSpan(w), nameM.Span, valueM.Span);
         }
 
         if (count > 0)
